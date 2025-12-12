@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: antigravity-proxy
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - DB_PATH=/app/data/database.sqlite
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      # 仪表盘「今日」统计时区（分钟），中国时间为 480
+      - DASHBOARD_TZ_OFFSET_MINUTES=${DASHBOARD_TZ_OFFSET_MINUTES:-480}
+      - PORT=3000
+    ports:
+      - "${PORT:-8080}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

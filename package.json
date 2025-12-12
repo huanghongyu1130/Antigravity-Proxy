@@ -1,0 +1,9 @@
+{
+  "name": "antigravity-proxy-monolith",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/start.mjs"
+  }
+}
+

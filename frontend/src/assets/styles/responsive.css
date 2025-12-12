@@ -1,0 +1,272 @@
+/* Responsive Styles */
+
+/* Mobile First Approach */
+
+/* Mobile (< 640px) */
+@media (max-width: 639px) {
+  :root {
+    --space-4: 12px;
+    --space-6: 16px;
+    --space-8: 24px;
+  }
+
+  .container {
+    padding: var(--space-4);
+  }
+
+  /* Hide desktop sidebar */
+  .desktop-only {
+    display: none !important;
+  }
+
+  /* Show mobile nav */
+  .mobile-only {
+    display: flex !important;
+  }
+
+  /* Stack grid items */
+  .stats-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-3);
+  }
+
+  /* Full width cards */
+  .card {
+    padding: var(--space-4);
+    border-radius: var(--radius-md);
+  }
+
+  /* Table to card view */
+  .table-responsive {
+    display: none;
+  }
+
+  .card-list-view {
+    display: flex !important;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  /* Modal becomes drawer */
+  .modal {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    max-width: none;
+    max-height: 90vh;
+    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+    margin: 0;
+  }
+
+  /* Adjust toast position */
+  .toast-container {
+    left: var(--space-4);
+    right: var(--space-4);
+    top: auto;
+    bottom: calc(var(--mobile-nav-height) + var(--space-4));
+  }
+
+  .toast {
+    min-width: auto;
+    max-width: none;
+  }
+
+  /* Full width buttons in modals */
+  .modal-footer {
+    flex-direction: column-reverse;
+  }
+
+  .modal-footer .btn {
+    width: 100%;
+  }
+
+  /* Dropdown adjustments */
+  .dropdown-menu {
+    position: fixed;
+    left: var(--space-4);
+    right: var(--space-4);
+    bottom: calc(var(--mobile-nav-height) + var(--space-4));
+    top: auto;
+    min-width: auto;
+  }
+
+  /* Hide long text */
+  .hide-mobile {
+    display: none;
+  }
+
+  /* Page header */
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+  }
+
+  .page-header-actions {
+    width: 100%;
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  .page-header-actions .btn {
+    flex: 1;
+  }
+}
+
+/* Tablet (640px - 1023px) */
+@media (min-width: 640px) and (max-width: 1023px) {
+  .container {
+    padding: var(--space-6);
+  }
+
+  /* Still hide desktop sidebar, show mobile nav */
+  .desktop-only {
+    display: none !important;
+  }
+
+  .mobile-only {
+    display: flex !important;
+  }
+
+  /* 2-column grid */
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* Table can be shown with horizontal scroll */
+  .table-responsive {
+    display: block;
+  }
+
+  .card-list-view {
+    display: none !important;
+  }
+}
+
+/* Desktop (>= 1024px) */
+@media (min-width: 1024px) {
+  .container {
+    padding: var(--space-8);
+  }
+
+  /* Show desktop sidebar */
+  .desktop-only {
+    display: flex !important;
+  }
+
+  /* Hide mobile nav */
+  .mobile-only {
+    display: none !important;
+  }
+
+  /* 4-column stats grid */
+  .stats-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  /* Table view */
+  .table-responsive {
+    display: block;
+  }
+
+  .card-list-view {
+    display: none !important;
+  }
+
+  /* Two-column layouts */
+  .two-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-6);
+  }
+
+  /* Wide modal */
+  .modal-wide {
+    max-width: 640px;
+  }
+}
+
+/* Large Desktop (>= 1280px) */
+@media (min-width: 1280px) {
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  /* Larger stats grid */
+  .stats-grid {
+    gap: var(--space-6);
+  }
+}
+
+/* Touch device optimizations */
+@media (hover: none) and (pointer: coarse) {
+  /* Larger touch targets */
+  .btn {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .btn-sm {
+    min-height: 36px;
+  }
+
+  .dropdown-item {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  /* Remove hover states (they don't work well on touch) */
+  .table tr:hover td {
+    background: transparent;
+  }
+}
+
+/* Print styles */
+@media print {
+  .sidebar,
+  .mobile-nav,
+  .header-actions,
+  .btn,
+  .toast-container {
+    display: none !important;
+  }
+
+  .main-content {
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    background: white;
+    color: black;
+  }
+
+  .card {
+    border: 1px solid #ccc;
+    break-inside: avoid;
+  }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  :root {
+    --border-color: rgba(255, 255, 255, 0.3);
+    --text-muted: #a1a1aa;
+  }
+
+  .btn {
+    border: 2px solid currentColor;
+  }
+}
