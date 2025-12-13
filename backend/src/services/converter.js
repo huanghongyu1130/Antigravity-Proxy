@@ -3,6 +3,7 @@ import { getMappedModel, isThinkingModel, AVAILABLE_MODELS } from '../config.js'
 
 // 默认思考预算
 const DEFAULT_THINKING_BUDGET = 4096;
+const DEFAULT_TEMPERATURE = 1;
 
 /**
  * OpenAI 请求 → Antigravity 请求转换
@@ -88,7 +89,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 
     // 构建 generationConfig
     const generationConfig = {
-        temperature: temperature ?? 0.7,
+        temperature: temperature ?? DEFAULT_TEMPERATURE,
         maxOutputTokens: max_tokens || 8192,
         candidateCount: 1
     };
@@ -669,7 +670,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
 
     // 构建 generationConfig
     const generationConfig = {
-        temperature: temperature ?? 0.7,
+        temperature: temperature ?? DEFAULT_TEMPERATURE,
         maxOutputTokens: max_tokens || 8192,
         candidateCount: 1
     };
