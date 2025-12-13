@@ -38,6 +38,15 @@ function run(cmd, args, opts) {
   });
 }
 
+function runNpm(args, opts) {
+  if (process.platform === 'win32') {
+    const comspec = process.env.ComSpec || 'cmd.exe';
+    const command = ['npm', ...args].join(' ');
+    return run(comspec, ['/d', '/s', '/c', command], { ...opts, windowsHide: true });
+  }
+  return run('npm', args, opts);
+}
+
 async function ensureDeps() {
   const npmEnv = {
     ...process.env,
@@ -48,17 +57,17 @@ async function ensureDeps() {
     npm_config_fund: 'false'
   };
   if (!existsSync(join(frontendDir, 'node_modules'))) {
-    await run('npm', ['install'], { cwd: frontendDir, env: npmEnv });
+    await runNpm(['install'], { cwd: frontendDir, env: npmEnv });
   }
   if (!existsSync(join(backendDir, 'node_modules'))) {
-    await run('npm', ['install'], { cwd: backendDir, env: npmEnv });
+    await runNpm(['install'], { cwd: backendDir, env: npmEnv });
   }
 }
 
 async function ensureFrontendBuild() {
   const distIndex = join(frontendDir, 'dist', 'index.html');
   if (!existsSync(distIndex)) {
-    await run('npm', ['run', 'build'], {
+    await runNpm(['run', 'build'], {
       cwd: frontendDir,
       env: {
         ...process.env,
