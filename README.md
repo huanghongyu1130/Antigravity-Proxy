@@ -269,6 +269,21 @@ antigravity-proxy/
       └─ components/
 ```
 
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `PORT` | `8088` | 对外端口（`npm start` 监听端口 / Docker 映射端口；容器内固定监听 `3000`） |
+| `HOST` | `0.0.0.0` | 监听地址（`npm start` 用） |
+| `DB_PATH` | `../data/database.sqlite` | SQLite 路径（`npm start` 默认；Docker 固定 `/app/data/database.sqlite`） |
+| `ADMIN_PASSWORD` | `admin123` | 管理面板密码 |
+| `JWT_SECRET` | `antigravity-proxy-secret-key-2024` | 管理 JWT 密钥 |
+| `ADMIN_PASSWORD_BEARER_COMPAT` | `true` | 兼容 `Authorization: Bearer <ADMIN_PASSWORD>`（建议生产关闭） |
+| `DASHBOARD_TZ_OFFSET_MINUTES` | `480` | 仪表盘“今日”统计时区偏移（分钟） |
+| `MAX_CONCURRENT_PER_ACCOUNT` | `1` | 单账号并发上限 |
+| `MAX_CONCURRENT_PER_MODEL` | `3` | 单模型并发上限 |
+| `CAPACITY_COOLDOWN_DEFAULT_MS` | `3000` | 上游容量耗尽后的默认冷却时间（毫秒） |
+
 ## License
 
 MIT
