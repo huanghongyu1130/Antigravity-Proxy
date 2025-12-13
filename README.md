@@ -32,8 +32,6 @@ cd antigravity-proxy
 npm start
 ```
 
-首次运行会自动（**只执行一次**）安装依赖（npm workspaces：前端+后端）并构建前端（可能需要几分钟）；之后再次启动通常会快很多。
-为了让首次启动更快，本仓库默认提交了 `frontend/dist`（预构建管理面板），因此大多数情况下首次 `npm start` 只需要安装后端依赖即可。
 
 ### 方式 B：Docker 一条命令（部署用）
 
