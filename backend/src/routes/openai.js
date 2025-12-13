@@ -124,7 +124,8 @@ export default async function openaiRoutes(fastify) {
                 usage = {
                     promptTokens: openaiResponse.usage.prompt_tokens,
                     completionTokens: openaiResponse.usage.completion_tokens,
-                    totalTokens: openaiResponse.usage.total_tokens
+                    totalTokens: openaiResponse.usage.total_tokens,
+                    thinkingTokens: antigravityResponse?.response?.usageMetadata?.thoughtsTokenCount || 0
                 };
 
                 responseForLog = openaiResponse;

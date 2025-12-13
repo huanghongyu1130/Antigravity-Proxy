@@ -162,7 +162,8 @@ export default async function anthropicRoutes(fastify) {
                 usage = {
                     promptTokens: anthropicResponse.usage.input_tokens,
                     completionTokens: anthropicResponse.usage.output_tokens,
-                    totalTokens: anthropicResponse.usage.input_tokens + anthropicResponse.usage.output_tokens
+                    totalTokens: anthropicResponse.usage.input_tokens + anthropicResponse.usage.output_tokens,
+                    thinkingTokens: antigravityResponse?.response?.usageMetadata?.thoughtsTokenCount || 0
                 };
 
                 responseForLog = anthropicResponse;

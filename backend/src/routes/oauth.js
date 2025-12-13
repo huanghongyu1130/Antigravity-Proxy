@@ -1,10 +1,11 @@
 import { OAUTH_CONFIG } from '../config.js';
 import { createAccount, getAccountByEmail, updateAccountToken } from '../db/index.js';
 import { initializeAccount } from '../services/tokenManager.js';
+import { verifyAdmin } from '../middleware/auth.js';
 
 export default async function oauthRoutes(fastify) {
     // POST /oauth/exchange - 用授权码交换 token（前端传入 code 和 port）
-    fastify.post('/oauth/exchange', async (request, reply) => {
+    fastify.post('/oauth/exchange', { preHandler: verifyAdmin }, async (request, reply) => {
         const { code, port } = request.body;
 
         if (!code || !port) {
@@ -103,7 +104,7 @@ export default async function oauthRoutes(fastify) {
     });
 
     // GET /oauth/config - 获取前端需要的 OAuth 配置
-    fastify.get('/oauth/config', async () => {
+    fastify.get('/oauth/config', { preHandler: verifyAdmin }, async () => {
         return {
             client_id: OAUTH_CONFIG.client_id,
             scope: OAUTH_CONFIG.scope,
