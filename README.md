@@ -11,8 +11,8 @@ OpenAI / Anthropic 兼容的 Antigravity 反代网关（账号池 + Web 管理�
 ```bash
 cat > .env <<'EOF'
 PORT=8088
-ADMIN_PASSWORD=change-me
-JWT_SECRET=change-me-too
+ADMIN_PASSWORD=admin123
+JWT_SECRET=change-me
 
 # 可选（一般不用填）：npm start 会自动用 ../data/database.sqlite
 # DB_PATH=../data/database.sqlite
