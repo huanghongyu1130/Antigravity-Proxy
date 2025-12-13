@@ -298,18 +298,9 @@ const formatTime = (timestamp) => {
 const formatResetTime = (timestamp) => {
   if (!timestamp) return '-'
   const date = new Date(timestamp)
-  const now = new Date()
-  const diff = date - now
-
-  if (diff <= 0) return '已重置'
-
-  const hours = Math.floor(diff / (1000 * 60 * 60))
-  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60))
-
-  if (hours > 0) {
-    return `${hours}小时${minutes}分钟后`
-  }
-  return `${minutes}分钟后`
+  const formatted = date.toLocaleString()
+  if (timestamp <= Date.now()) return `${formatted}（已重置）`
+  return formatted
 }
 
 const refreshAllTokensAndQuotas = async () => {
@@ -667,6 +658,7 @@ onMounted(fetchAccounts)
             <div class="quota-list-header">
               <span>模型</span>
               <span>剩余配额</span>
+              <span>重置时间</span>
             </div>
             <div
               v-for="quota in sortedQuotas"
@@ -688,6 +680,9 @@ onMounted(fetchAccounts)
                 <span class="quota-percent" :class="getQuotaColor(quota.remainingFraction)">
                   {{ Math.round((quota.remainingFraction || 0) * 100) }}%
                 </span>
+              </div>
+              <div class="quota-reset">
+                {{ formatResetTime(quota.resetTime) }}
               </div>
             </div>
 
@@ -1176,6 +1171,18 @@ onMounted(fetchAccounts)
 .quota-percent.warning { color: var(--warning); }
 .quota-percent.error { color: var(--error); }
 
+.quota-reset {
+  width: 200px;
+  flex-shrink: 0;
+  text-align: right;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .quota-empty,
 .quota-error {
   text-align: center;
@@ -1225,6 +1232,12 @@ onMounted(fetchAccounts)
 
   .quota-bar {
     width: 100%;
+  }
+
+  .quota-reset {
+    width: 100%;
+    text-align: left;
+    white-space: normal;
   }
 }
 </style>
