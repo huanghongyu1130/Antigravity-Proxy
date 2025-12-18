@@ -240,6 +240,7 @@ Anthropic extended thinking 要求历史 `thinking` 块带 `signature`。由于�
 
 ## 支持模型（`/v1/models` 返回）
 
+- `gemini-3-flash`
 - `gemini-3-pro-high`
 - `gemini-3-pro-low`
 - `gemini-2.5-pro`

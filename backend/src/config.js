@@ -40,6 +40,7 @@ function parseBoolean(value, defaultValue) {
 
 // 可用模型列表
 export const AVAILABLE_MODELS = [
+    { id: 'gemini-3-flash', displayName: 'Gemini 3 Flash', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
     { id: 'gemini-3-pro-high', displayName: 'Gemini 3 Pro (High)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65535 },
     { id: 'gemini-3-pro-low', displayName: 'Gemini 3 Pro (Low)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65535 },
     { id: 'gemini-2.5-pro', displayName: 'Gemini 2.5 Pro', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65535 },

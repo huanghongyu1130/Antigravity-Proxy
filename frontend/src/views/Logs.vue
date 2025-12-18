@@ -13,7 +13,7 @@ const stats = ref({})
 const loading = ref(false)
 
 const models = [
-  'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3-pro-high', 'gemini-3-pro-low',
+  'gemini-3-flash', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3-pro-high', 'gemini-3-pro-low',
   'claude-opus-4-5', 'claude-opus-4-5-thinking', 'claude-sonnet-4-5', 'claude-sonnet-4-5-thinking'
 ]
 
