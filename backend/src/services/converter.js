@@ -166,26 +166,26 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     // 检查是否是 Claude 模型（Claude 不支持 topP，且 extended thinking 在 tool_use 链路需要签名）
     const isClaudeModel = model.includes('claude');
 
-    // OpenAI 端：Claude 在工具链路需要回放签名；若历史里已有 tool_calls/tool 结果但缓存缺失，则降级禁用 thinking 避免上游报错
+    const looksLikeClaudeToolId = (id) => typeof id === 'string' && id.startsWith('toolu_');
+
+    // OpenAI 端：Claude 在工具链路需要回放签名（仅针对 Claude 自己生成的 tool_call_id）
+    // 如果历史里存在 Claude 的 tool_calls/tool 结果但缓存缺失，则降级禁用 thinking 避免上游报错
     let enableThinking = isThinkingModel(model);
     if (enableThinking && isClaudeModel && (hasToolCallsInHistory || hasToolResultsInHistory)) {
         const ids = new Set();
         for (const msg of nonSystemMessages) {
             if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
                 for (const tc of msg.tool_calls) {
-                    if (tc?.id) ids.add(tc.id);
+                    if (tc?.id && looksLikeClaudeToolId(tc.id)) ids.add(tc.id);
                 }
             }
             if (msg.role === 'tool' && msg.tool_call_id) {
-                ids.add(msg.tool_call_id);
+                if (looksLikeClaudeToolId(msg.tool_call_id)) ids.add(msg.tool_call_id);
             }
         }
         for (const id of ids) {
-            // 优先 Claude 专属缓存；其次 tool 级 thoughtSignature（跨模型历史时可能只有这个）
             const cachedClaude = getCachedClaudeToolThinking(id);
-            const cachedToolSig = getCachedToolThoughtSignature(id);
-            const hasAnySignature = Boolean(cachedClaude?.signature || cachedToolSig);
-            if (!hasAnySignature) {
+            if (!cachedClaude?.signature) {
                 enableThinking = false;
                 break;
             }
@@ -201,20 +201,35 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
             const toolParts = [];
             while (i < nonSystemMessages.length && nonSystemMessages[i].role === 'tool') {
                 const toolMsg = nonSystemMessages[i];
-                toolParts.push({
-                    functionResponse: {
-                        id: toolMsg.tool_call_id,
-                        name: toolMsg.name || 'unknown',
-                        response: {
-                            output: typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content)
+                // 跨模型历史：如果当前是 Claude，但历史 tool_call_id 不是 Claude 风格（toolu_），则降级为纯文本上下文
+                if (isClaudeModel && toolMsg.tool_call_id && !looksLikeClaudeToolId(toolMsg.tool_call_id)) {
+                    const name = toolMsg.name || 'unknown';
+                    const output = typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content);
+                    toolParts.push({ text: `[tool:${name}] ${output}` });
+                } else {
+                    toolParts.push({
+                        functionResponse: {
+                            id: toolMsg.tool_call_id,
+                            name: toolMsg.name || 'unknown',
+                            response: {
+                                output: typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content)
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 i++;
             }
             i--; // 回退一步，因为外层循环会 i++
             contents.push({ role: 'user', parts: toolParts });
         } else {
+            // 跨模型历史：如果当前是 Claude，但某条历史 assistant.tool_calls 不是 Claude 风格，直接跳过该条（保留 tool 结果文本即可）
+            if (isClaudeModel && msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.some(tc => tc?.id && !looksLikeClaudeToolId(tc.id))) {
+                // 若有显式文本内容，仍保留为模型文本；否则跳过
+                if (msg.content) {
+                    contents.push({ role: 'model', parts: [{ text: msg.content }] });
+                }
+                continue;
+            }
             contents.push(convertMessage(msg, { isClaudeModel, enableThinking }));
         }
     }
@@ -326,13 +341,11 @@ function convertMessage(msg, ctx = {}) {
         if (isClaudeModel && enableThinking) {
             const firstToolCallId = msg.tool_calls?.[0]?.id;
             const replayClaude = firstToolCallId ? getCachedClaudeToolThinking(firstToolCallId) : null;
-            const replayToolSig = firstToolCallId ? getCachedToolThoughtSignature(firstToolCallId) : null;
-            const signature = replayClaude?.signature || replayToolSig;
-            if (signature) {
+            if (replayClaude?.signature) {
                 parts.push({
                     thought: true,
-                    text: CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replayClaude?.thoughtText || '') : '',
-                    thoughtSignature: signature
+                    text: CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replayClaude.thoughtText || '') : '',
+                    thoughtSignature: replayClaude.signature
                 });
             }
         }
