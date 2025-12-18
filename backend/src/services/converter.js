@@ -151,32 +151,6 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     const contents = [];
     const nonSystemMessages = messages.filter(m => m.role !== 'system');
 
-    for (let i = 0; i < nonSystemMessages.length; i++) {
-        const msg = nonSystemMessages[i];
-
-        // 如果是工具结果，收集所有连续的工具结果合并为一条消息
-        if (msg.role === 'tool') {
-            const toolParts = [];
-            while (i < nonSystemMessages.length && nonSystemMessages[i].role === 'tool') {
-                const toolMsg = nonSystemMessages[i];
-                toolParts.push({
-                    functionResponse: {
-                        id: toolMsg.tool_call_id,
-                        name: toolMsg.name || 'unknown',
-                        response: {
-                            output: typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content)
-                        }
-                    }
-                });
-                i++;
-            }
-            i--; // 回退一步，因为外层循环会 i++
-            contents.push({ role: 'user', parts: toolParts });
-        } else {
-            contents.push(convertMessage(msg));
-        }
-    }
-
     // 获取实际模型名称
     const actualModel = getMappedModel(model);
 
@@ -207,11 +181,41 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
             }
         }
         for (const id of ids) {
-            const cached = getCachedClaudeToolThinking(id);
-            if (!cached?.signature) {
+            // 优先 Claude 专属缓存；其次 tool 级 thoughtSignature（跨模型历史时可能只有这个）
+            const cachedClaude = getCachedClaudeToolThinking(id);
+            const cachedToolSig = getCachedToolThoughtSignature(id);
+            const hasAnySignature = Boolean(cachedClaude?.signature || cachedToolSig);
+            if (!hasAnySignature) {
                 enableThinking = false;
                 break;
             }
+        }
+    }
+
+    // 转换对话消息（排除 system），合并连续的工具结果
+    for (let i = 0; i < nonSystemMessages.length; i++) {
+        const msg = nonSystemMessages[i];
+
+        // 如果是工具结果，收集所有连续的工具结果合并为一条消息
+        if (msg.role === 'tool') {
+            const toolParts = [];
+            while (i < nonSystemMessages.length && nonSystemMessages[i].role === 'tool') {
+                const toolMsg = nonSystemMessages[i];
+                toolParts.push({
+                    functionResponse: {
+                        id: toolMsg.tool_call_id,
+                        name: toolMsg.name || 'unknown',
+                        response: {
+                            output: typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content)
+                        }
+                    }
+                });
+                i++;
+            }
+            i--; // 回退一步，因为外层循环会 i++
+            contents.push({ role: 'user', parts: toolParts });
+        } else {
+            contents.push(convertMessage(msg, { isClaudeModel, enableThinking }));
         }
     }
 
@@ -292,7 +296,8 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 /**
  * 转换单条消息
  */
-function convertMessage(msg) {
+function convertMessage(msg, ctx = {}) {
+    const { isClaudeModel = false, enableThinking = false } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // 处理工具调用结果
@@ -315,15 +320,21 @@ function convertMessage(msg) {
     if (msg.role === 'assistant' && msg.tool_calls) {
         const parts = [];
 
-        // OpenAI 端点：为 Claude tools 回放 thinking.signature（代理内缓存，不依赖客户端字段）
-        const firstToolCallId = msg.tool_calls?.[0]?.id;
-        const replay = firstToolCallId ? getCachedClaudeToolThinking(firstToolCallId) : null;
-        if (replay?.signature) {
-            parts.push({
-                thought: true,
-                text: CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replay.thoughtText || '') : '',
-                thoughtSignature: replay.signature
-            });
+        // OpenAI 端点：为 Claude tools 回放签名（代理内缓存，不依赖客户端字段）
+        // - 优先使用 Claude 专属缓存（包含 signature + 可选 thoughtText）
+        // - 跨模型历史：如果该 tool_call_id 只有 tool 级 thoughtSignature，也用它做兜底
+        if (isClaudeModel && enableThinking) {
+            const firstToolCallId = msg.tool_calls?.[0]?.id;
+            const replayClaude = firstToolCallId ? getCachedClaudeToolThinking(firstToolCallId) : null;
+            const replayToolSig = firstToolCallId ? getCachedToolThoughtSignature(firstToolCallId) : null;
+            const signature = replayClaude?.signature || replayToolSig;
+            if (signature) {
+                parts.push({
+                    thought: true,
+                    text: CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replayClaude?.thoughtText || '') : '',
+                    thoughtSignature: signature
+                });
+            }
         }
 
         // 如果有文本内容（必须在 thinking 之后，避免 Claude tool_use 校验失败）
