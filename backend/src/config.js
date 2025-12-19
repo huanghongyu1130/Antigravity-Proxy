@@ -62,6 +62,9 @@ export const AVAILABLE_MODELS = [
 // 模型名称映射（用户请求的模型 -> 实际发送的模型）
 export const MODEL_MAPPING = {
     'claude-opus-4-5': 'claude-opus-4-5-thinking',
+    // Claude Code 常用简写模型名（避免上游报 Requested entity was not found）
+    'claude-4-5-thinking': 'claude-opus-4-5-thinking',
+    'claude-4-5': 'claude-opus-4-5-thinking',
     // thinking 版本在上游是独立模型：不要降级到非 thinking，否则会导致工具调用场景无思维链输出
     'claude-sonnet-4-5-thinking': 'claude-sonnet-4-5-thinking',
     // Claude Haiku 不存在，映射到 Opus

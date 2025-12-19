@@ -30,15 +30,21 @@ export async function streamChat(account, request, onData, onError, signal = nul
         if (!response.ok) {
             const errorText = await response.text();
             let errorMessage = `API Error: ${response.status}`;
+            let parsed = null;
 
             try {
                 const errorJson = JSON.parse(errorText);
+                parsed = errorJson;
                 errorMessage = errorJson.error?.message || errorMessage;
             } catch {
                 errorMessage = errorText || errorMessage;
             }
 
-            throw new Error(errorMessage);
+            const err = new Error(errorMessage);
+            err.upstreamStatus = response.status;
+            if (parsed) err.upstreamJson = parsed;
+            err.upstreamBody = errorText;
+            throw err;
         }
 
         // 处理 SSE 流
@@ -136,15 +142,21 @@ export async function chat(account, request) {
     if (!response.ok) {
         const errorText = await response.text();
         let errorMessage = `API Error: ${response.status}`;
+        let parsed = null;
 
         try {
             const errorJson = JSON.parse(errorText);
+            parsed = errorJson;
             errorMessage = errorJson.error?.message || errorMessage;
         } catch {
             errorMessage = errorText || errorMessage;
         }
 
-        throw new Error(errorMessage);
+        const err = new Error(errorMessage);
+        err.upstreamStatus = response.status;
+        if (parsed) err.upstreamJson = parsed;
+        err.upstreamBody = errorText;
+        throw err;
     }
 
     return response.json();

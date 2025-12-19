@@ -13,6 +13,20 @@ import { createRequestLog } from '../db/index.js';
 import { isThinkingModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
 
+function parseResetAfterMs(message) {
+    if (!message) return null;
+    const m = String(message).match(/reset after (\\d+)s/i);
+    if (!m) return null;
+    const seconds = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(seconds) || seconds < 0) return null;
+    return (seconds + 1) * 1000;
+}
+
+function sleep(ms) {
+    if (!ms || ms <= 0) return Promise.resolve();
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export default async function openaiRoutes(fastify) {
     // POST /v1/chat/completions
     fastify.post('/v1/chat/completions', {
@@ -32,6 +46,17 @@ export default async function openaiRoutes(fastify) {
         let streamChunksForLog = null;
         let errorResponseForLog = null;
 
+        const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
+        const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
+        const isCapacityError = (err) => {
+            const msg = err?.message || '';
+            return (
+                msg.includes('exhausted your capacity on this model') ||
+                msg.includes('Resource has been exhausted') ||
+                err?.upstreamStatus === 429
+            );
+        };
+
         try {
             // 1. 获取模型并发槽位（避免本地直接打爆上游）
             modelSlotAcquired = acquireModelSlot(model);
@@ -48,12 +73,9 @@ export default async function openaiRoutes(fastify) {
                 return reply.code(429).send(errorResponseForLog);
             }
 
-            // 2. 获取最优账号
-            account = await accountPool.getBestAccount(model);
-
-            // 3. 转换请求格式（传入账号的 project_id）
-            const antigravityRequest = convertOpenAIToAntigravity(openaiRequest, account.project_id);
-            const requestId = antigravityRequest.requestId.replace('agent-', '');
+            // 2/3. 先转换请求格式（requestId 固定），project 在选择账号后再注入，便于容量错误时重试切号
+            const antigravityRequestBase = convertOpenAIToAntigravity(openaiRequest, '');
+            const requestId = antigravityRequestBase.requestId.replace('agent-', '');
 
             // 4. 流式或非流式处理
             if (stream) {
@@ -74,46 +96,75 @@ export default async function openaiRoutes(fastify) {
 
                 let lastUsage = null;
 
-                invokedUpstream = true;
-                await streamChat(
-                    account,
-                    antigravityRequest,
-                    (data) => {
-                        // 提取 usage 信息
-                        const extractedUsage = extractUsageFromSSE(data);
-                        if (extractedUsage) {
-                            lastUsage = extractedUsage;
-                        }
+                try {
+                    let attempt = 0;
+                    while (true) {
+                        attempt++;
+                        account = await accountPool.getBestAccount(model);
+                        const antigravityRequest = structuredClone(antigravityRequestBase);
+                        antigravityRequest.project = account.project_id || '';
 
-                        // 转换并发送响应（thinking 模型返回思维链）
-                        const chunks = convertSSEChunk(data, requestId, model, isThinkingModel(model));
-                        if (chunks) {
-                            for (const chunk of chunks) {
-                                // 若 converter 生成了 error chunk，标记本次请求为 error（但仍以 SSE 方式返回）
-                                if (chunk?.error?.message) {
-                                    status = 'error';
-                                    errorMessage = chunk.error.message;
-                                    errorResponseForLog = chunk;
+                        invokedUpstream = true;
+                        try {
+                            await streamChat(
+                                account,
+                                antigravityRequest,
+                                (data) => {
+                                    // 提取 usage 信息
+                                    const extractedUsage = extractUsageFromSSE(data);
+                                    if (extractedUsage) {
+                                        lastUsage = extractedUsage;
+                                    }
+
+                                    // 转换并发送响应（thinking 模型返回思维链）
+                                    const chunks = convertSSEChunk(data, requestId, model, isThinkingModel(model));
+                                    if (chunks) {
+                                        for (const chunk of chunks) {
+                                            // 若 converter 生成了 error chunk，标记本次请求为 error（但仍以 SSE 方式返回）
+                                            if (chunk?.error?.message) {
+                                                status = 'error';
+                                                errorMessage = chunk.error.message;
+                                                errorResponseForLog = chunk;
+                                            }
+                                            streamChunksForLog.push(chunk);
+                                            reply.raw.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                                        }
+                                    }
+                                },
+                                null,
+                                abortController.signal
+                            );
+
+                            accountPool.markCapacityRecovered(account.id, model);
+                            break;
+                        } catch (err) {
+                            if (abortController.signal.aborted) return;
+                            if (account && isCapacityError(err)) {
+                                accountPool.markCapacityLimited(account.id, model, err.message || '');
+                                accountPool.unlockAccount(account.id);
+                                account = null;
+                                if (attempt <= maxRetries + 1 && streamChunksForLog.length === 0) {
+                                    const resetMs = parseResetAfterMs(err?.message);
+                                    const delay = resetMs ?? (baseRetryDelayMs * attempt);
+                                    await sleep(delay);
+                                    continue;
                                 }
-                                streamChunksForLog.push(chunk);
-                                reply.raw.write(`data: ${JSON.stringify(chunk)}\n\n`);
                             }
+                            throw err;
                         }
-                    },
-                    (error) => {
-                        status = 'error';
-                        errorMessage = error.message;
-                        const errorChunk = {
-                            error: {
-                                message: error.message,
-                                type: 'api_error'
-                            }
-                        };
-                        streamChunksForLog.push(errorChunk);
-                        reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-                    },
-                    abortController.signal
-                );
+                    }
+                } catch (err) {
+                    status = 'error';
+                    errorMessage = err.message;
+                    const errorChunk = {
+                        error: {
+                            message: err.message,
+                            type: 'api_error'
+                        }
+                    };
+                    streamChunksForLog.push(errorChunk);
+                    reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                }
 
                 // 上游有时会返回“HTTP 200 + SSE 结束”，但没有任何有效内容（例如安全拦截/空回复）
                 // 这种情况下给客户端一个明确的 error chunk，避免出现“空回复且不报错”
@@ -145,8 +196,34 @@ export default async function openaiRoutes(fastify) {
                 responseForLog = { stream: true, chunks: streamChunksForLog, done: true };
             } else {
                 // 非流式请求（thinking 模型返回思维链）
-                invokedUpstream = true;
-                const antigravityResponse = await chat(account, antigravityRequest);
+                let antigravityResponse = null;
+                let attempt = 0;
+                while (true) {
+                    attempt++;
+                    account = await accountPool.getBestAccount(model);
+                    const antigravityRequest = structuredClone(antigravityRequestBase);
+                    antigravityRequest.project = account.project_id || '';
+
+                    try {
+                        invokedUpstream = true;
+                        antigravityResponse = await chat(account, antigravityRequest);
+                        accountPool.markCapacityRecovered(account.id, model);
+                        break;
+                    } catch (err) {
+                        if (account && isCapacityError(err)) {
+                            accountPool.markCapacityLimited(account.id, model, err.message || '');
+                            accountPool.unlockAccount(account.id);
+                            account = null;
+                            if (attempt <= maxRetries + 1) {
+                                const resetMs = parseResetAfterMs(err?.message);
+                                const delay = resetMs ?? (baseRetryDelayMs * attempt);
+                                await sleep(delay);
+                                continue;
+                            }
+                        }
+                        throw err;
+                    }
+                }
                 const openaiResponse = convertResponse(antigravityResponse, requestId, model, isThinkingModel(model));
 
                 usage = {
@@ -164,20 +241,18 @@ export default async function openaiRoutes(fastify) {
             errorMessage = error.message;
 
             const msg = error.message || '';
-            const isCapacityError =
-                msg.includes('exhausted your capacity on this model') ||
-                msg.includes('Resource has been exhausted');
+            const capacity = isCapacityError(error);
 
             // 容量耗尽：不把账号标成 error，只做短暂冷却，并返回 429
-            if (account && isCapacityError) {
+            if (account && capacity) {
                 accountPool.markCapacityLimited(account.id, model, msg);
             } else if (account) {
                 // 其他错误依然标记账号错误，避免持续使用异常账号
                 accountPool.markAccountError(account.id, error);
             }
 
-            const httpStatus = isCapacityError ? 429 : 500;
-            const errorCode = isCapacityError ? 'rate_limit_exceeded' : 'internal_error';
+            const httpStatus = capacity ? 429 : 500;
+            const errorCode = capacity ? 'rate_limit_exceeded' : 'internal_error';
 
             // 返回 OpenAI 格式的错误
             errorResponseForLog = {

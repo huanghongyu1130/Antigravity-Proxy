@@ -1,5 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getMappedModel, isThinkingModel, AVAILABLE_MODELS } from '../config.js';
+import { createHash } from 'crypto';
+import { getDatabase } from '../db/index.js';
 
 // 默认思考预算
 const DEFAULT_THINKING_BUDGET = 4096;
@@ -16,9 +18,95 @@ const toolThoughtSignatureCache = new Map(); // key: tool_call_id -> { signature
 // Antigravity 上游对 Claude 也会下发 thoughtSignature（可能出现在 thought part 上，text 为空）。
 // 但部分客户端不会保留 thinking.signature，下一轮回放工具历史会触发上游校验失败。
 // 这里以 tool_use_id（= functionCall.id）为 key 做短期缓存，并在请求侧自动补齐/回放到上游。
-const CLAUDE_THINKING_SIGNATURE_TTL_MS = Number(process.env.CLAUDE_THINKING_SIGNATURE_TTL_MS || 10 * 60 * 1000);
+const CLAUDE_THINKING_SIGNATURE_TTL_MS = Number(process.env.CLAUDE_THINKING_SIGNATURE_TTL_MS || 24 * 60 * 60 * 1000);
 const CLAUDE_THINKING_SIGNATURE_MAX = Number(process.env.CLAUDE_THINKING_SIGNATURE_MAX || 5000);
 const claudeThinkingSignatureCache = new Map(); // key: tool_use_id -> { signature, savedAt }
+
+// Claude extended thinking：部分回合上游不会再次下发 thoughtSignature（但下一轮仍要求历史 assistant 以 thinking/redacted_thinking 开头）。
+// 实测这种情况下复用“最近一次可用的 signature”可以让上游继续接受工具链路。
+// 因此以 userKey 为 key 维护一个 last-signature 缓存，用于：
+// - 当某次 tool_use 响应缺失 signature 时，仍能为 tool_use_id 填充 signature
+// - 让 streaming 输出始终以 thinking/redacted_thinking 开头（避免 Claude Code 在下一轮触发校验失败）
+const CLAUDE_LAST_SIGNATURE_TTL_MS = Number(process.env.CLAUDE_LAST_SIGNATURE_TTL_MS || 24 * 60 * 60 * 1000);
+const CLAUDE_LAST_SIGNATURE_MAX = Number(process.env.CLAUDE_LAST_SIGNATURE_MAX || 50000);
+const claudeLastThinkingSignatureCache = new Map(); // key: userKey -> { signature, savedAt }
+
+const SIGNATURE_CACHE_KIND_CLAUDE_THINKING = 'claude_thinking_signature';
+const SIGNATURE_CACHE_KIND_CLAUDE_LAST_THINKING = 'claude_last_thinking_signature';
+let signatureCacheGetStmt = null;
+let signatureCacheUpsertStmt = null;
+let signatureCacheDeleteStmt = null;
+let signatureCacheCleanupStmt = null;
+let lastSignatureCacheCleanupAt = 0;
+
+function ensureSignatureCacheStatements() {
+    if (signatureCacheGetStmt && signatureCacheUpsertStmt && signatureCacheDeleteStmt && signatureCacheCleanupStmt) return;
+    try {
+        const db = getDatabase();
+        signatureCacheGetStmt = db.prepare(
+            'SELECT signature, saved_at FROM signature_cache WHERE kind = ? AND cache_key = ?'
+        );
+        signatureCacheUpsertStmt = db.prepare(
+            'INSERT INTO signature_cache (kind, cache_key, signature, saved_at) VALUES (?, ?, ?, ?) ' +
+            'ON CONFLICT(kind, cache_key) DO UPDATE SET signature = excluded.signature, saved_at = excluded.saved_at'
+        );
+        signatureCacheDeleteStmt = db.prepare(
+            'DELETE FROM signature_cache WHERE kind = ? AND cache_key = ?'
+        );
+        signatureCacheCleanupStmt = db.prepare(
+            'DELETE FROM signature_cache WHERE kind = ? AND saved_at < ?'
+        );
+    } catch {
+        // db not initialized / table not ready
+    }
+}
+
+function upsertSignatureCache(kind, cacheKey, signature, savedAt) {
+    if (!kind || !cacheKey || !signature || !savedAt) return;
+    try {
+        ensureSignatureCacheStatements();
+        if (!signatureCacheUpsertStmt) return;
+        signatureCacheUpsertStmt.run(kind, cacheKey, signature, savedAt);
+    } catch {
+        // ignore
+    }
+}
+
+function getSignatureCache(kind, cacheKey) {
+    try {
+        ensureSignatureCacheStatements();
+        if (!signatureCacheGetStmt) return null;
+        return signatureCacheGetStmt.get(kind, cacheKey) || null;
+    } catch {
+        return null;
+    }
+}
+
+function deleteSignatureCache(kind, cacheKey) {
+    try {
+        ensureSignatureCacheStatements();
+        if (!signatureCacheDeleteStmt) return;
+        signatureCacheDeleteStmt.run(kind, cacheKey);
+    } catch {
+        // ignore
+    }
+}
+
+function maybeCleanupSignatureCache(kind, ttlMs) {
+    if (!kind) return;
+    if (!ttlMs || ttlMs <= 0) return;
+    const now = Date.now();
+    // 每 5 分钟最多清理一次，避免频繁写 DB
+    if (now - lastSignatureCacheCleanupAt < 5 * 60 * 1000) return;
+    try {
+        ensureSignatureCacheStatements();
+        if (!signatureCacheCleanupStmt) return;
+        signatureCacheCleanupStmt.run(kind, now - ttlMs);
+        lastSignatureCacheCleanupAt = now;
+    } catch {
+        // ignore
+    }
+}
 
 // OpenAI 端点：Claude tools + thinking 回放
 // OpenAI 协议没有 signature 字段，因此我们在代理内缓存 “tool_call_id -> {signature, thoughtText}”，
@@ -29,6 +117,49 @@ const CLAUDE_OPENAI_REPLAY_THOUGHT_TEXT = String(process.env.CLAUDE_OPENAI_REPLA
 const CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT = !['0', 'false', 'no', 'n', 'off'].includes(CLAUDE_OPENAI_REPLAY_THOUGHT_TEXT);
 const claudeToolThinkingCache = new Map(); // key: tool_call_id -> { signature, thoughtText, savedAt }
 const claudeToolThinkingBuffer = new Map(); // key: requestId -> { signature, thoughtText }
+
+// Claude extended thinking：按“用户会回放的 assistant 内容”缓存 signature，用于客户端不回放 thinking 块时的自动补齐
+const CLAUDE_ASSISTANT_SIGNATURE_TTL_MS = Number(process.env.CLAUDE_ASSISTANT_SIGNATURE_TTL_MS || 6 * 60 * 60 * 1000);
+const CLAUDE_ASSISTANT_SIGNATURE_MAX = Number(process.env.CLAUDE_ASSISTANT_SIGNATURE_MAX || 10000);
+const claudeAssistantSignatureCache = new Map(); // key: `${userKey}|${hash}` -> { signature, savedAt }
+
+function stableStringify(value) {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+    const keys = Object.keys(value).sort();
+    return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+function hashForAssistantSignatureReplay(content) {
+    // content: string | array blocks
+    const normalized = stableStringify(content);
+    return createHash('sha256').update(normalized).digest('hex');
+}
+
+function cacheClaudeAssistantSignature(userKey, assistantContentWithoutThinking, signature) {
+    if (!userKey || !signature) return;
+    const hash = hashForAssistantSignatureReplay(assistantContentWithoutThinking);
+    const key = `${String(userKey)}|${hash}`;
+    claudeAssistantSignatureCache.set(key, { signature: String(signature), savedAt: Date.now() });
+    if (CLAUDE_ASSISTANT_SIGNATURE_MAX > 0 && claudeAssistantSignatureCache.size > CLAUDE_ASSISTANT_SIGNATURE_MAX) {
+        const oldestKey = claudeAssistantSignatureCache.keys().next().value;
+        if (oldestKey) claudeAssistantSignatureCache.delete(oldestKey);
+    }
+}
+
+function getCachedClaudeAssistantSignature(userKey, assistantContentWithoutThinking) {
+    if (!userKey) return null;
+    const hash = hashForAssistantSignatureReplay(assistantContentWithoutThinking);
+    const key = `${String(userKey)}|${hash}`;
+    const entry = claudeAssistantSignatureCache.get(key);
+    if (!entry) return null;
+    if (CLAUDE_ASSISTANT_SIGNATURE_TTL_MS > 0 && Date.now() - entry.savedAt > CLAUDE_ASSISTANT_SIGNATURE_TTL_MS) {
+        claudeAssistantSignatureCache.delete(key);
+        return null;
+    }
+    return entry.signature;
+}
 
 function cacheToolThoughtSignature(toolCallId, signature) {
     if (!toolCallId || !signature) return;
@@ -83,7 +214,12 @@ function getCachedClaudeToolThinking(toolCallId) {
 function cacheClaudeThinkingSignature(toolUseId, signature) {
     if (!toolUseId || !signature) return;
     const key = String(toolUseId);
-    claudeThinkingSignatureCache.set(key, { signature: String(signature), savedAt: Date.now() });
+    const savedAt = Date.now();
+    const sig = String(signature);
+    claudeThinkingSignatureCache.set(key, { signature: sig, savedAt });
+    // 持久化：避免容器重启 / TTL 过短导致下轮无法回放 signature 而被迫禁用 thinking
+    upsertSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_THINKING, key, sig, savedAt);
+    maybeCleanupSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_THINKING, CLAUDE_THINKING_SIGNATURE_TTL_MS);
 
     if (CLAUDE_THINKING_SIGNATURE_MAX > 0 && claudeThinkingSignatureCache.size > CLAUDE_THINKING_SIGNATURE_MAX) {
         const oldestKey = claudeThinkingSignatureCache.keys().next().value;
@@ -91,16 +227,71 @@ function cacheClaudeThinkingSignature(toolUseId, signature) {
     }
 }
 
+function cacheClaudeLastThinkingSignature(userKey, signature) {
+    if (!userKey || !signature) return;
+    const key = String(userKey);
+    const savedAt = Date.now();
+    const sig = String(signature);
+    claudeLastThinkingSignatureCache.set(key, { signature: sig, savedAt });
+    upsertSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_LAST_THINKING, key, sig, savedAt);
+    maybeCleanupSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_LAST_THINKING, CLAUDE_LAST_SIGNATURE_TTL_MS);
+
+    if (CLAUDE_LAST_SIGNATURE_MAX > 0 && claudeLastThinkingSignatureCache.size > CLAUDE_LAST_SIGNATURE_MAX) {
+        const oldestKey = claudeLastThinkingSignatureCache.keys().next().value;
+        if (oldestKey) claudeLastThinkingSignatureCache.delete(oldestKey);
+    }
+}
+
+function getCachedClaudeLastThinkingSignature(userKey) {
+    if (!userKey) return null;
+    const key = String(userKey);
+    const now = Date.now();
+    const entry = claudeLastThinkingSignatureCache.get(key);
+    if (entry) {
+        if (CLAUDE_LAST_SIGNATURE_TTL_MS > 0 && now - entry.savedAt > CLAUDE_LAST_SIGNATURE_TTL_MS) {
+            claudeLastThinkingSignatureCache.delete(key);
+        } else {
+            return entry.signature;
+        }
+    }
+
+    const row = getSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_LAST_THINKING, key);
+    if (!row) return null;
+    const savedAt = Number(row.saved_at) || 0;
+    if (CLAUDE_LAST_SIGNATURE_TTL_MS > 0 && savedAt > 0 && now - savedAt > CLAUDE_LAST_SIGNATURE_TTL_MS) {
+        deleteSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_LAST_THINKING, key);
+        return null;
+    }
+    const sig = row.signature ? String(row.signature) : '';
+    if (!sig) return null;
+    claudeLastThinkingSignatureCache.set(key, { signature: sig, savedAt: savedAt || now });
+    return sig;
+}
+
 function getCachedClaudeThinkingSignature(toolUseId) {
     if (!toolUseId) return null;
     const key = String(toolUseId);
+    const now = Date.now();
     const entry = claudeThinkingSignatureCache.get(key);
-    if (!entry) return null;
-    if (CLAUDE_THINKING_SIGNATURE_TTL_MS > 0 && Date.now() - entry.savedAt > CLAUDE_THINKING_SIGNATURE_TTL_MS) {
-        claudeThinkingSignatureCache.delete(key);
+    if (entry) {
+        if (CLAUDE_THINKING_SIGNATURE_TTL_MS > 0 && now - entry.savedAt > CLAUDE_THINKING_SIGNATURE_TTL_MS) {
+            claudeThinkingSignatureCache.delete(key);
+        } else {
+            return entry.signature;
+        }
+    }
+
+    const row = getSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_THINKING, key);
+    if (!row) return null;
+    const savedAt = Number(row.saved_at) || 0;
+    if (CLAUDE_THINKING_SIGNATURE_TTL_MS > 0 && savedAt > 0 && now - savedAt > CLAUDE_THINKING_SIGNATURE_TTL_MS) {
+        deleteSignatureCache(SIGNATURE_CACHE_KIND_CLAUDE_THINKING, key);
         return null;
     }
-    return entry.signature;
+    const sig = row.signature ? String(row.signature) : '';
+    if (!sig) return null;
+    claudeThinkingSignatureCache.set(key, { signature: sig, savedAt: savedAt || now });
+    return sig;
 }
 
 // OpenAI 兼容：思考内容输出格式
@@ -118,6 +309,40 @@ const OPENAI_THINKING_INCLUDE_TAGS =
     OPENAI_THINKING_OUTPUT === 'tags' ||
     OPENAI_THINKING_OUTPUT === 'tag' ||
     OPENAI_THINKING_OUTPUT === 'both';
+
+function extractThoughtSignature(value) {
+    if (!value) return null;
+    if (typeof value !== 'object') return null;
+    const sig = value.thoughtSignature || value.thought_signature;
+    if (!sig) return null;
+    return String(sig);
+}
+
+function extractThoughtSignatureFromPart(part) {
+    if (!part || typeof part !== 'object') return null;
+
+    return (
+        extractThoughtSignature(part) ||
+        extractThoughtSignature(part.metadata) ||
+        extractThoughtSignature(part.functionCall) ||
+        extractThoughtSignature(part.function_call) ||
+        extractThoughtSignature(part.functionCall?.metadata) ||
+        extractThoughtSignature(part.functionResponse) ||
+        extractThoughtSignature(part.function_response) ||
+        extractThoughtSignature(part.functionResponse?.metadata) ||
+        null
+    );
+}
+
+function extractThoughtSignatureFromCandidate(candidate, data = null) {
+    return (
+        extractThoughtSignature(candidate) ||
+        extractThoughtSignature(candidate?.content) ||
+        extractThoughtSignature(data?.response) ||
+        extractThoughtSignature(data) ||
+        null
+    );
+}
 
 /**
  * OpenAI 请求 → Antigravity 请求转换
@@ -595,7 +820,7 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
             // 处理工具调用
             if (part.functionCall) {
                 const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
-                const sig = part.thoughtSignature || part.thought_signature;
+                const sig = extractThoughtSignatureFromPart(part);
                 if (sig) {
                     cacheToolThoughtSignature(callId, sig);
                 }
@@ -667,7 +892,7 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
         }
 
         // 处理结束标志
-        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
+	        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
             claudeToolThinkingBuffer.delete(stateKey);
             // 如果还在思维链中，先关闭标签
             if (OPENAI_THINKING_INCLUDE_TAGS && thinkingState.get(stateKey)) {
@@ -891,6 +1116,19 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
     // 转换消息
     const contents = [];
 
+    // tool_result 在 Anthropic 协议里通常不带 name 字段，只给 tool_use_id。
+    // Antigravity 的 functionResponse 需要 name 才能正确匹配/消费工具输出。
+    // 因此这里提前扫描 assistant 的 tool_use 块，建立 tool_use_id -> name 的映射。
+    const toolUseNameById = new Map();
+    for (const m of messages || []) {
+        if (m?.role !== 'assistant' || !Array.isArray(m.content)) continue;
+        for (const block of m.content) {
+            if (block?.type === 'tool_use' && block?.id && typeof block?.name === 'string' && block.name.trim()) {
+                toolUseNameById.set(block.id, block.name.trim());
+            }
+        }
+    }
+
     for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
 
@@ -901,7 +1139,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
                 const parts = toolResults.map(tr => ({
                     functionResponse: {
                         id: tr.tool_use_id,
-                        name: tr.name || 'unknown',
+                        name: tr.name || toolUseNameById.get(tr.tool_use_id) || 'unknown',
                         response: {
                             output: typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content)
                         }
@@ -975,21 +1213,17 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
 
     // 添加工具定义
     if (tools && tools.length > 0) {
-        // 过滤掉 Anthropic 内置工具（如 web_search, computer_use 等）
-        // 内置工具有 type 字段（如 "web_search_20250305"），普通函数工具有 input_schema
-        const functionTools = tools.filter(t => {
-            // 内置工具有 type 字段且以特定前缀开头
-            if (t.type && (t.type.startsWith('web_search') ||
-                          t.type.startsWith('computer') ||
-                          t.type.startsWith('text_editor') ||
-                          t.type.startsWith('bash'))) {
-                return false;
-            }
-            return true;
-        });
+        // Anthropic 兼容：支持 Claude Code/Anthropic 内置工具（web_search/computer_use/text_editor/bash）
+        // 这些工具在 Anthropic 协议中通常以 {type:"bash_YYYYMMDD"} 这种形式出现（没有 name/input_schema）。
+        // Antigravity 侧只支持 functionDeclarations，因此这里把它们“降维”成普通函数工具：
+        // - 让模型可以正常发出 tool_use
+        // - 由客户端（如 Claude Code/Cherry Studio）执行并回传 tool_result
+        const normalizedTools = tools
+            .map(t => normalizeAnthropicTool(t, isClaudeModel))
+            .filter(Boolean);
 
-        if (functionTools.length > 0) {
-            request.request.tools = [{ functionDeclarations: functionTools.map(t => convertAnthropicTool(t, isClaudeModel)) }];
+        if (normalizedTools.length > 0) {
+            request.request.tools = [{ functionDeclarations: normalizedTools.map(t => convertAnthropicTool(t, isClaudeModel)) }];
 
             let toolMode = 'AUTO';
             if (tool_choice) {
@@ -1011,6 +1245,120 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
     return request;
 }
 
+function normalizeAnthropicTool(tool, isClaudeModel = false) {
+    if (!tool) return null;
+
+    // 普通函数工具（Anthropic 兼容：name + input_schema）
+    if (tool.name && tool.input_schema) return tool;
+
+    const type = typeof tool.type === 'string' ? tool.type : '';
+    if (!type) return null;
+
+    // Anthropic 内置工具：type 中带版本后缀（例如 bash_20241022 / web_search_20250305）
+    const startsWith = (prefix) => type === prefix || type.startsWith(prefix + '_') || type.startsWith(prefix);
+
+    let name = null;
+    if (startsWith('web_search')) name = 'web_search';
+    else if (startsWith('computer_use')) name = 'computer_use';
+    else if (startsWith('computer')) name = 'computer';
+    else if (startsWith('text_editor')) name = 'text_editor';
+    else if (startsWith('bash')) name = 'bash';
+    else return null;
+
+    const descParts = [];
+    if (typeof tool.description === 'string' && tool.description.trim()) descParts.push(tool.description.trim());
+    else descParts.push(`Built-in tool: ${name}`);
+
+    // computer/computer_use 工具通常会在 tool definition 上携带屏幕信息（给模型参考）
+    const w = tool.display_width_px ?? tool.displayWidthPx;
+    const h = tool.display_height_px ?? tool.displayHeightPx;
+    if ((name === 'computer' || name === 'computer_use') && Number.isFinite(w) && Number.isFinite(h)) {
+        descParts.push(`Display: ${w}x${h}px`);
+    }
+
+    const input_schema = getBuiltinAnthropicToolSchema(name);
+
+    return {
+        name,
+        description: descParts.join(' | '),
+        input_schema
+    };
+}
+
+function getBuiltinAnthropicToolSchema(name) {
+    // 说明：这里的 schema 主要用于让上游 function calling 可用，并尽量贴近 Anthropic 的常见入参。
+    // 由于不同客户端/版本可能扩展字段，我们把 required 控制在最小集合，并尽量覆盖常用字段。
+    if (name === 'bash') {
+        return {
+            type: 'object',
+            properties: {
+                command: { type: 'string', description: 'Shell command to run' },
+                timeout_ms: { type: 'integer', description: 'Optional timeout in milliseconds' }
+            },
+            required: ['command']
+        };
+    }
+
+    if (name === 'text_editor') {
+        return {
+            type: 'object',
+            properties: {
+                command: { type: 'string', description: 'Editor command (view/create/replace/insert/undo/...)' },
+                path: { type: 'string', description: 'File path' },
+                file_text: { type: 'string', description: 'Full file contents (for create)' },
+                old_str: { type: 'string', description: 'String to replace' },
+                new_str: { type: 'string', description: 'Replacement string' },
+                insert_line: { type: 'integer', description: 'Line number to insert at (1-based)' },
+                text: { type: 'string', description: 'Text to insert' },
+                view_range: {
+                    type: 'array',
+                    items: { type: 'integer' },
+                    description: 'Optional line range, e.g. [start, end]'
+                }
+            },
+            required: ['command']
+        };
+    }
+
+    if (name === 'web_search') {
+        return {
+            type: 'object',
+            properties: {
+                query: { type: 'string', description: 'Search query' },
+                max_results: { type: 'integer', description: 'Max results' },
+                locale: { type: 'string', description: 'Optional locale/region' },
+                time_range: { type: 'string', description: 'Optional time range filter (day/week/month/year)' }
+            },
+            required: ['query']
+        };
+    }
+
+    if (name === 'computer' || name === 'computer_use') {
+        return {
+            type: 'object',
+            properties: {
+                action: { type: 'string', description: 'Action name (screenshot/mouse_move/click/type/key/scroll/...)' },
+                x: { type: 'integer', description: 'X coordinate' },
+                y: { type: 'integer', description: 'Y coordinate' },
+                coordinates: {
+                    type: 'array',
+                    items: { type: 'integer' },
+                    description: 'Optional [x, y] coordinate pair'
+                },
+                text: { type: 'string', description: 'Text to type' },
+                key: { type: 'string', description: 'Key to press' },
+                button: { type: 'string', description: 'Mouse button' },
+                clicks: { type: 'integer', description: 'Click count' },
+                scroll_amount: { type: 'integer', description: 'Scroll amount' },
+                direction: { type: 'string', description: 'Scroll direction' }
+            },
+            required: ['action']
+        };
+    }
+
+    return { type: 'object', properties: {} };
+}
+
 /**
  * 转换 Anthropic 格式的单条消息
  */
@@ -1030,24 +1378,45 @@ function convertAnthropicMessage(msg, thinkingEnabled = false) {
         const regularParts = [];
         const functionCallParts = [];
 
-	        for (const item of msg.content) {
+	    for (const item of msg.content) {
 	            // 处理 thinking 块 - 保留为 thought 部分
 	            if (item.type === 'thinking') {
+                    const rawThinking =
+                        typeof item.thinking === 'string'
+                            ? item.thinking
+                            : (item.thinking && typeof item.thinking.thinking === 'string' ? item.thinking.thinking : '');
+                    const rawSignature =
+                        item.signature ||
+                        (item.thinking && typeof item.thinking.signature === 'string' ? item.thinking.signature : undefined);
+
+                    // 兼容 Vertex/部分中间层：如果带 signature 但 thinking 为空字符串，
+                    // 可能在上游序列化时被当作“未设置”导致校验失败；用空格占位保证字段存在。
+                    const thinkingText = (rawSignature && rawThinking === '') ? ' ' : rawThinking;
+
 	                regularParts.push({
-	                    text: item.thinking,
+	                    text: thinkingText,
 	                    thought: true,
-	                    ...(item.signature ? { thoughtSignature: item.signature } : {})
+	                    ...(rawSignature ? { thoughtSignature: rawSignature } : {})
 	                });
 	                continue;
 	            }
 
-            // 处理 redacted_thinking 块 - 直接跳过，不发送给 Antigravity
-            // 原因：Antigravity 会把 thought:true 的部分转换为 thinking 块发送给 Claude，
-            // 但 Claude API 要求 thinking 块必须有 signature，而我们无法提供
-            if (item.type === 'redacted_thinking') {
-                // 跳过 redacted_thinking，不添加到 parts 中
-                continue;
-            }
+            // 处理 redacted_thinking 块
+            // - 若包含 signature：可安全透传为 thought part（text 为空即可）
+            // - 若缺少 signature：不透传（否则会触发上游校验失败），交给 preprocess 做降级/清洗
+	            if (item.type === 'redacted_thinking') {
+                    const sig =
+                        item.signature ||
+                        (item.redacted_thinking && typeof item.redacted_thinking.signature === 'string' ? item.redacted_thinking.signature : undefined);
+	                if (sig) {
+	                    regularParts.push({
+	                        text: ' ',
+	                        thought: true,
+	                        thoughtSignature: sig
+	                    });
+	                }
+	                continue;
+	            }
 
             // 处理文本
             if (item.type === 'text') {
@@ -1128,7 +1497,7 @@ function convertAnthropicTool(tool, isClaudeModel = false) {
 /**
  * Antigravity 响应 → Anthropic 响应转换
  */
-export function convertAntigravityToAnthropic(antigravityResponse, requestId, model, thinkingEnabled = false) {
+export function convertAntigravityToAnthropic(antigravityResponse, requestId, model, thinkingEnabled = false, userKey = null) {
     try {
         const data = antigravityResponse;
         const candidate = data.response?.candidates?.[0];
@@ -1149,14 +1518,14 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
 
         const content = [];
         let thinkingText = '';
-        let messageThinkingSignature = null;
+        let messageThinkingSignature = extractThoughtSignatureFromCandidate(candidate, data);
         const toolUseIds = [];
 
         // 先收集 thinking（以及 signature）
         if (thinkingEnabled) {
             for (const part of thinkingParts) {
                 thinkingText += (part.text || '');
-                const sig = part.thoughtSignature || part.thought_signature;
+                const sig = extractThoughtSignatureFromPart(part);
                 if (sig) messageThinkingSignature = sig;
             }
         }
@@ -1164,7 +1533,7 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
         // 再处理其他 blocks（text / tool_use / image）
         for (const part of otherParts) {
             // 有些上游会把 Claude 的签名放在非 thought part 上（例如 functionCall part），这里也兜底采集
-            const sig = part.thoughtSignature || part.thought_signature;
+            const sig = extractThoughtSignatureFromPart(part);
             if (sig) messageThinkingSignature = sig;
 
             if (part.text !== undefined) {
@@ -1194,12 +1563,36 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
             }
         }
 
+        // 若本回合没有下发 signature，但我们有“上一回合的 signature”，则复用它：
+        // - 让 tool_use 也能拥有 signature 以便下一轮回放
+        // - 让响应以 thinking/redacted_thinking 开头（Claude Code / 上游校验需要）
+        if (thinkingEnabled && !messageThinkingSignature && userKey) {
+            const recovered = getCachedClaudeLastThinkingSignature(userKey);
+            if (recovered) messageThinkingSignature = recovered;
+        }
+
         if (thinkingEnabled && (thinkingText || messageThinkingSignature)) {
-            content.unshift({
-                type: 'thinking',
-                thinking: thinkingText,
-                ...(messageThinkingSignature ? { signature: messageThinkingSignature } : {})
-            });
+            // 没有 thinking 文本时不要伪造（可能导致 signature 校验不一致），用 redacted_thinking
+            if (!thinkingText && messageThinkingSignature) {
+                content.unshift({ type: 'redacted_thinking', signature: messageThinkingSignature });
+            } else {
+                content.unshift({
+                    type: 'thinking',
+                    thinking: thinkingText || '',
+                    ...(messageThinkingSignature ? { signature: messageThinkingSignature } : {})
+                });
+            }
+        }
+
+        // 更新 last-signature（用于后续 signature 缺失的回合兜底）
+        if (messageThinkingSignature && userKey) {
+            cacheClaudeLastThinkingSignature(userKey, messageThinkingSignature);
+        }
+
+        // 缓存 signature：用于客户端不回放 thinking 块时，下一轮自动补齐
+        if (messageThinkingSignature && userKey) {
+            const contentWithoutThinking = content.filter(b => b && b.type !== 'thinking' && b.type !== 'redacted_thinking');
+            cacheClaudeAssistantSignature(userKey, contentWithoutThinking, messageThinkingSignature);
         }
 
         if (messageThinkingSignature && toolUseIds.length > 0) {
@@ -1252,24 +1645,83 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 
 	        const events = [];
 	        let newState = { ...state };
+            if (!('thinkingEnabled' in newState)) newState.thinkingEnabled = null;
+            if (!('userKey' in newState)) newState.userKey = null;
 	        if (!('lastThinkingSignature' in newState)) newState.lastThinkingSignature = null;
+            if (!('lastUserThinkingSignature' in newState)) {
+                newState.lastUserThinkingSignature = newState.userKey ? getCachedClaudeLastThinkingSignature(newState.userKey) : null;
+            }
 	        if (!Array.isArray(newState.pendingToolUseIds)) newState.pendingToolUseIds = [];
+            if (!('thinkingStopped' in newState)) newState.thinkingStopped = false;
+
+            const thinkingEnabledForResponse =
+                newState.thinkingEnabled === null || newState.thinkingEnabled === undefined
+                    ? isThinkingModel(model)
+                    : !!newState.thinkingEnabled;
 
 	        // 先分离 thinking 和非 thinking 的 parts
 	        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
 	        const thinkingParts = parts.filter(p => p.thought);
 	        const otherParts = parts.filter(p => !p.thought);
 
+            // 兜底：有些上游会把签名放在 candidate 级别或 functionCall 内部
+            const preSig =
+                extractThoughtSignatureFromCandidate(candidate, data) ||
+                parts.map(extractThoughtSignatureFromPart).find(Boolean) ||
+                null;
+            if (preSig) {
+                newState.lastThinkingSignature = preSig;
+                if (newState.userKey) {
+                    cacheClaudeLastThinkingSignature(newState.userKey, preSig);
+                    newState.lastUserThinkingSignature = preSig;
+                }
+                if (newState.pendingToolUseIds.length > 0) {
+                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, preSig);
+                    newState.pendingToolUseIds = [];
+                }
+            }
+
+            const ensureLeadingThinkingBlock = () => {
+                if (!thinkingEnabledForResponse) return;
+                if (newState.hasThinking) return;
+
+                const sig = newState.lastThinkingSignature || newState.lastUserThinkingSignature || null;
+                if (sig) {
+                    events.push({
+                        type: 'content_block_start',
+                        index: 0,
+                        content_block: { type: 'redacted_thinking', signature: sig }
+                    });
+                } else {
+                    events.push({
+                        type: 'content_block_start',
+                        index: 0,
+                        content_block: { type: 'thinking', thinking: '' }
+                    });
+                }
+                events.push({ type: 'content_block_stop', index: 0 });
+
+                newState.hasThinking = true;
+                newState.thinkingIndex = 0;
+                newState.thinkingStopped = true;
+                newState.nextIndex = 1;
+            };
+
 	        // 先处理 thinking（确保 thinking 在前，index 0）
 	        for (const part of thinkingParts) {
-	            const sig = part.thoughtSignature || part.thought_signature;
+	            const sig = extractThoughtSignatureFromPart(part);
 	            if (sig) {
 	                newState.lastThinkingSignature = sig;
+                    if (newState.userKey) {
+                        cacheClaudeLastThinkingSignature(newState.userKey, sig);
+                        newState.lastUserThinkingSignature = sig;
+                    }
 	                if (newState.pendingToolUseIds.length > 0) {
 	                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, sig);
 	                    newState.pendingToolUseIds = [];
 	                }
 	            }
+                if (newState.thinkingStopped) continue;
 	            if (!newState.inThinking) {
 	                // thinking 始终是 index 0
 	                newState.thinkingIndex = 0;
@@ -1303,9 +1755,13 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 	        // 处理其他 parts（text 和 functionCall）
 	        for (const part of otherParts) {
 	            // 兜底：部分上游会把签名放在非 thought part 上（例如 functionCall part）
-	            const sig = part.thoughtSignature || part.thought_signature;
+	            const sig = extractThoughtSignatureFromPart(part);
 	            if (sig) {
 	                newState.lastThinkingSignature = sig;
+                    if (newState.userKey) {
+                        cacheClaudeLastThinkingSignature(newState.userKey, sig);
+                        newState.lastUserThinkingSignature = sig;
+                    }
 	                if (newState.pendingToolUseIds.length > 0) {
 	                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, sig);
 	                    newState.pendingToolUseIds = [];
@@ -1319,6 +1775,18 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                     index: 0
                 });
                 newState.inThinking = false;
+                newState.thinkingStopped = true;
+            }
+
+            // thinking 启用时，确保响应的第一个块是 thinking/redacted_thinking（Claude Code/上游校验需要）
+            // 注意：上游可能会先发一个“空 text”占位 chunk（text: ""），随后才开始下发 thought parts。
+            // 这种情况下不能提前插入占位 thinking，否则会把后续真实 thinking_delta 全部吃掉。
+            const willEmitNonThinkingContent =
+                (part.text !== undefined && part.text !== '') ||
+                !!part.functionCall ||
+                !!part.inlineData;
+            if (thinkingEnabledForResponse && willEmitNonThinkingContent) {
+                ensureLeadingThinkingBlock();
             }
 
             // 处理文本（跳过空文本）
@@ -1355,8 +1823,11 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 	                const toolIndex = newState.nextIndex || (newState.hasThinking ? 1 : 0);
 	                newState.nextIndex = toolIndex + 1;
 	                const toolUseId = part.functionCall.id || `toolu_${uuidv4().slice(0, 8)}`;
-	                if (newState.lastThinkingSignature) {
-	                    cacheClaudeThinkingSignature(toolUseId, newState.lastThinkingSignature);
+                    const fallbackSig = newState.lastThinkingSignature || newState.lastUserThinkingSignature || null;
+	                if (fallbackSig) {
+                        // 上游有时不会在该回合再次下发 signature：复用 last-signature 让工具链路不断档
+	                    cacheClaudeThinkingSignature(toolUseId, fallbackSig);
+                        if (!newState.lastThinkingSignature) newState.lastThinkingSignature = fallbackSig;
 	                } else {
 	                    newState.pendingToolUseIds.push(toolUseId);
 	                }
@@ -1396,6 +1867,7 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                     type: 'content_block_stop',
                     index: 0
                 });
+                newState.thinkingStopped = true;
             }
             if (newState.inText) {
                 events.push({
@@ -1416,14 +1888,14 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 }
             });
 
-            events.push({ type: 'message_stop' });
-        }
+	            events.push({ type: 'message_stop' });
+	        }
 
-        return { events, state: newState };
-    } catch (error) {
-        return { events: [], state };
-    }
-}
+	        return { events, state: newState };
+	    } catch (error) {
+	        return { events: [], state };
+	    }
+	}
 
 /**
  * 预处理 Anthropic 请求
@@ -1431,11 +1903,9 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
  * 核心问题：Claude API 的 extended thinking 要求所有带 tool_use 的 assistant 消息
  * 必须以 thinking 块开头，且 thinking 块必须有有效的 signature。
  *
- * 由于我们无法伪造 signature，当检测到历史消息中有 tool_use 但没有 thinking 块时，
- * 自动禁用 thinking 模式以避免 API 错误。
- *
- * 注意：这意味着如果用户使用了工具，之后的对话将没有 thinking 输出。
- * 这是 Claude API 限制导致的，除非客户端完整保留带 signature 的 thinking 块。
+ * 由于部分客户端不会回放/持久化 thinking.signature，代理会优先从本地缓存（tool_use_id -> signature）
+ * 尝试恢复并补齐历史消息；只有在“含 tool_use 的历史消息”无法恢复 signature 时，才会降级禁用 thinking，
+ * 以避免上游直接报错。
  */
 export function preprocessAnthropicRequest(request) {
     // 检测 thinking 模式 - 显式启用或根据模型名自动启用
@@ -1446,82 +1916,252 @@ export function preprocessAnthropicRequest(request) {
         return request;
     }
 
-    // 检查历史消息中是否有 assistant 消息没有有效的 thinking 块
-    // 说明：部分客户端不会保留 thinking.signature。代理会尝试用该条 assistant 消息内的 tool_use_id
-    // 从本地缓存反查并补齐 signature；若仍无法补齐，则只能禁用 thinking 以避免上游校验失败。
-    let needsDisabling = false;
+    const extractSystemText = (sys) => {
+        const texts = [];
+        if (typeof sys === 'string') {
+            texts.push(sys);
+        } else if (Array.isArray(sys)) {
+            for (const s of sys) {
+                if (typeof s === 'string') texts.push(s);
+                else if (s && typeof s.text === 'string') texts.push(s.text);
+            }
+        }
+        return texts.join('\n');
+    };
 
-    for (const msg of request.messages) {
-        if (msg.role !== 'assistant') continue;
+    const systemText = extractSystemText(request.system);
+    const isClaudeCodeRequest =
+        systemText.includes('You are Claude Code') ||
+        systemText.includes("Claude Code, Anthropic's official CLI for Claude");
+    const userKey = request?.metadata?.user_id || null;
 
-        // 字符串内容没有 thinking 块
-        if (typeof msg.content === 'string') {
-            needsDisabling = true;
-            break;
+    // 兼容问题：部分客户端在回放历史时不会保留 thinking 块 / signature（尤其在 tool_use 场景）。
+    // Claude extended thinking 对“包含 tool_use 的 assistant 历史消息”有强校验：
+    // - 必须以 thinking/redacted_thinking 块开头
+    // - 必须携带有效 signature
+    //
+    // 代理策略：
+    // 1) 优先从本地缓存（tool_use_id -> signature）恢复并“补齐/插入” thinking 块，避免降级。
+    // 2) 对无 tool_use 的 assistant 历史消息：若存在无 signature 的 thinking 块，直接清洗掉（不必全局降级）。
+    // 3) 仅当“包含 tool_use 的历史消息”无法恢复 signature 时，才降级禁用 thinking（避免上游报错）。
+
+    let mustDisableThinking = false;
+    let didMutate = false;
+    const missingToolUseIdsForSignature = [];
+
+    let workingMessages = request.messages;
+    let workingSystem = request.system;
+
+    // Claude Code（以及类似“用 assistant '{' 作为 JSON 前缀”的调用）兼容：
+    // 这类请求在 messages 里塞一个最后的 assistant 文本块 "{"，用于强制模型输出 JSON。
+    // 但 extended thinking 开启时，上游会要求“最后的 assistant 消息”必须以 thinking/redacted_thinking 开头，
+    // 这个前缀会直接触发 invalid_request_error。
+    // 由于我们无法为“人为注入的 assistant 前缀”生成合法 signature，这里选择删除该前缀，
+    // 并补一条 system 提示要求输出以 '{' 开头，尽量保持原语义。
+    const looksLikeJsonOnlyInstruction =
+        systemText.includes('ONLY generate the JSON object') ||
+        systemText.includes('Only include these fields') ||
+        systemText.includes('Format your response as a JSON object') ||
+        systemText.includes('ONLY generate the JSON object, no other text');
+
+    const isAssistantJsonPrefix = (msg) => {
+        if (!msg || msg.role !== 'assistant') return false;
+        if (!Array.isArray(msg.content) || msg.content.length !== 1) return false;
+        const b = msg.content[0];
+        if (!b || b.type !== 'text') return false;
+        return String(b.text || '').trim() === '{';
+    };
+
+    if (looksLikeJsonOnlyInstruction) {
+        const filtered = [];
+        let droppedPrefix = false;
+        for (const m of workingMessages) {
+            if (isAssistantJsonPrefix(m)) {
+                droppedPrefix = true;
+                didMutate = true;
+                continue;
+            }
+            filtered.push(m);
+        }
+        if (droppedPrefix) {
+            workingMessages = filtered;
+
+            const hint = "Return only a single JSON object and start your response with '{'.";
+            if (!systemText.includes(hint)) {
+                if (Array.isArray(workingSystem)) {
+                    workingSystem = [...workingSystem, { type: 'text', text: hint }];
+                } else if (typeof workingSystem === 'string') {
+                    workingSystem = `${workingSystem}\n\n${hint}`;
+                } else if (workingSystem == null) {
+                    workingSystem = hint;
+                } else {
+                    // unknown shape, keep as-is
+                }
+                didMutate = true;
+            }
+        }
+    }
+
+    const normalizedMessages = workingMessages.map(msg => {
+        if (msg?.role !== 'assistant') return msg;
+        if (!Array.isArray(msg.content)) return msg; // 字符串/其它格式：不强制要求 thinking（除非包含 tool_use，但此时也不可能）
+
+        let localMutate = false;
+        const blocks = msg.content.slice();
+
+        // 若历史里已带 signature，更新 last-signature 缓存（为后续“本回合不再下发 signature”的 tool_use 做兜底）
+        if (userKey) {
+            const sigBlock = blocks.find(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking') && b.signature);
+            if (sigBlock?.signature) cacheClaudeLastThinkingSignature(userKey, sigBlock.signature);
         }
 
-        if (!Array.isArray(msg.content)) continue;
+        const toolUseIds = blocks
+            .filter(b => b && b.type === 'tool_use' && b.id)
+            .map(b => b.id);
+        const hasToolUse = toolUseIds.length > 0;
 
-        // 检查是否以 thinking 块开头
-        const firstBlock = msg.content[0];
-        const startsWithThinking = firstBlock &&
-            (firstBlock.type === 'thinking' || firstBlock.type === 'redacted_thinking');
+        const findAnyThinkingIndex = () => blocks.findIndex(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking'));
+        const firstThinkingIndex = findAnyThinkingIndex();
+        const firstBlock = blocks[0];
+        const startsWithThinking = firstBlock && (firstBlock.type === 'thinking' || firstBlock.type === 'redacted_thinking');
 
-        if (!startsWithThinking) {
-            needsDisabling = true;
-            break;
-        }
-
-        // 检查 thinking / redacted_thinking 块是否有 signature（Claude API 要求）
-        if ((firstBlock.type === 'thinking' || firstBlock.type === 'redacted_thinking') && !firstBlock.signature) {
-            const toolUseIds = msg.content
-                .filter(b => b && b.type === 'tool_use' && b.id)
-                .map(b => b.id);
-
-            let recovered = null;
+        // helper：从缓存恢复 signature（优先使用该条消息内的 tool_use_id）
+        const recoverSignature = () => {
             for (const id of toolUseIds) {
-                recovered = getCachedClaudeThinkingSignature(id);
-                if (recovered) break;
+                const recovered = getCachedClaudeThinkingSignature(id);
+                if (recovered) return recovered;
+            }
+            // 某些回合上游不会再次下发 thoughtSignature：用 last-signature 兜底
+            if (userKey) {
+                const lastSig = getCachedClaudeLastThinkingSignature(userKey);
+                if (lastSig) {
+                    for (const id of toolUseIds) cacheClaudeThinkingSignature(id, lastSig);
+                    return lastSig;
+                }
+            }
+            return null;
+        };
+
+        // 1) 含 tool_use：必须有“开头 thinking + signature”
+        if (hasToolUse) {
+            let signature = null;
+
+            // 1.1) 优先使用消息内已有 signature（thinking/redacted_thinking 任意位置）
+            if (firstThinkingIndex >= 0) {
+                const sig = blocks[firstThinkingIndex]?.signature;
+                if (sig) signature = sig;
             }
 
-            if (recovered) {
-                firstBlock.signature = recovered;
+            // 1.2) 其次从缓存恢复
+            if (!signature) {
+                signature = recoverSignature();
+            }
+
+            if (!signature) {
+                mustDisableThinking = true;
+                for (const id of toolUseIds) {
+                    if (id) missingToolUseIdsForSignature.push(String(id));
+                }
+                return msg;
+            }
+
+            // 1.3) 确保开头是 thinking/redacted_thinking 且带 signature
+            if (startsWithThinking) {
+                if (!blocks[0].signature) {
+                    blocks[0] = { ...blocks[0], signature };
+                    localMutate = true;
+                }
+                // 若客户端丢失 thinking 文本：不要伪造 thinking 内容（可能导致 signature 校验不一致），改用 redacted_thinking
+                if (blocks[0].type === 'thinking' && (blocks[0].thinking === '' || blocks[0].thinking === undefined)) {
+                    blocks[0] = { type: 'redacted_thinking', signature };
+                    localMutate = true;
+                }
+            } else if (firstThinkingIndex >= 0) {
+                // 有 thinking 但不在开头：移动到开头
+                const [thinkingBlock] = blocks.splice(firstThinkingIndex, 1);
+                const patchedThinkingBlock = thinkingBlock?.signature ? thinkingBlock : { ...thinkingBlock, signature };
+                const ensuredThinkingBlock =
+                    patchedThinkingBlock?.type === 'thinking' &&
+                    (patchedThinkingBlock.thinking === '' || patchedThinkingBlock.thinking === undefined)
+                        ? { type: 'redacted_thinking', signature }
+                        : patchedThinkingBlock;
+                blocks.unshift(ensuredThinkingBlock);
+                localMutate = true;
             } else {
-                needsDisabling = true;
-                break;
+                // 没有 thinking：插入一个 redacted_thinking 块（不伪造 thinking 文本）
+                blocks.unshift({ type: 'redacted_thinking', signature });
+                localMutate = true;
+            }
+
+            if (localMutate) didMutate = true;
+            return localMutate ? { ...msg, content: blocks } : msg;
+        }
+
+        // Claude Code 兼容：如果客户端没回放 thinking 块，但我们曾经对“同内容的 assistant 消息”缓存过 signature，
+        // 则在这里自动补一个空 thinking 块（携带 signature）以满足 extended thinking 的历史校验。
+        if (isClaudeCodeRequest && !startsWithThinking) {
+            const contentWithoutThinking = blocks.filter(b => b && b.type !== 'thinking' && b.type !== 'redacted_thinking');
+            const recoveredSig = getCachedClaudeAssistantSignature(userKey, contentWithoutThinking);
+            if (recoveredSig) {
+                blocks.unshift({ type: 'redacted_thinking', signature: recoveredSig });
+                localMutate = true;
             }
         }
+
+        // 2) 不含 tool_use：清洗掉缺少 signature 的 thinking/redacted_thinking（避免上游校验失败）
+        if (firstThinkingIndex >= 0) {
+            const hasInvalidThinking = blocks.some(b =>
+                b && (b.type === 'thinking' || b.type === 'redacted_thinking') && !b.signature
+            );
+            if (hasInvalidThinking) {
+                const filtered = blocks.filter(b =>
+                    !(b && (b.type === 'thinking' || b.type === 'redacted_thinking') && !b.signature)
+                );
+                if (filtered.length === 0) filtered.push({ type: 'text', text: '' });
+                didMutate = true;
+                return { ...msg, content: filtered };
+            }
+        }
+
+        if (localMutate) didMutate = true;
+        return localMutate ? { ...msg, content: blocks } : msg;
+    });
+
+    if (!mustDisableThinking) {
+        if (!didMutate) return request;
+        const out = { ...request, messages: normalizedMessages };
+        if (workingSystem !== request.system) out.system = workingSystem;
+        return out;
     }
 
-    if (!needsDisabling) {
-        return request;
+    // 降级：禁用 thinking，并移除历史中所有 thinking/redacted_thinking 块（否则会触发校验失败）
+    try {
+        const uniqueMissing = Array.from(new Set(missingToolUseIdsForSignature)).slice(0, 50);
+        console.warn(JSON.stringify({
+            kind: 'thinking_downgrade',
+            provider: 'anthropic',
+            model: request?.model || null,
+            user_id: request?.metadata?.user_id || null,
+            reason: 'missing_thinking_signature_for_tool_use_history',
+            missing_tool_use_ids: uniqueMissing,
+            missing_count: missingToolUseIdsForSignature.length
+        }));
+    } catch {
+        // ignore
     }
 
-    // 禁用 thinking 并从历史消息中移除所有 thinking 块
-    const cleanedMessages = request.messages.map(msg => {
-        if (msg.role !== 'assistant') return msg;
-
-        // 字符串内容保持不变
-        if (typeof msg.content === 'string') return msg;
-
+    const cleanedMessages = normalizedMessages.map(msg => {
+        if (msg?.role !== 'assistant') return msg;
         if (!Array.isArray(msg.content)) return msg;
 
-        // 过滤掉 thinking 块
         const filteredContent = msg.content.filter(block =>
             block.type !== 'thinking' && block.type !== 'redacted_thinking'
         );
-
-        // 如果过滤后没有内容，添加一个空文本块
-        if (filteredContent.length === 0) {
-            filteredContent.push({ type: 'text', text: '' });
-        }
-
+        if (filteredContent.length === 0) filteredContent.push({ type: 'text', text: '' });
         return { ...msg, content: filteredContent };
     });
 
-    return {
-        ...request,
-        thinking: { type: 'disabled' },
-        messages: cleanedMessages
-    };
+    const out = { ...request, thinking: { type: 'disabled' }, messages: cleanedMessages };
+    if (workingSystem !== request.system) out.system = workingSystem;
+    return out;
 }

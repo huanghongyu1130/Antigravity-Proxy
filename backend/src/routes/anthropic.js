@@ -11,6 +11,282 @@ import {
 import { createRequestLog } from '../db/index.js';
 import { isThinkingModel, AVAILABLE_MODELS } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
+import { searchWeb } from '../services/webSearch.js';
+import { createHash } from 'crypto';
+
+function parseResetAfterMs(message) {
+    if (!message) return null;
+    const m = String(message).match(/reset after (\\d+)s/i);
+    if (!m) return null;
+    const seconds = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(seconds) || seconds < 0) return null;
+    return (seconds + 1) * 1000;
+}
+
+function sleep(ms) {
+    if (!ms || ms <= 0) return Promise.resolve();
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getSystemText(system) {
+    if (!system) return '';
+    if (typeof system === 'string') return system;
+    if (Array.isArray(system)) {
+        return system.map(s => (typeof s === 'string' ? s : (s?.text || ''))).join('\n');
+    }
+    return '';
+}
+
+function contentToText(content) {
+    if (!content) return '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        return content
+            .map(c => (typeof c === 'string' ? c : (c?.text || '')))
+            .join('\n');
+    }
+    if (content && typeof content === 'object' && typeof content.text === 'string') return content.text;
+    return String(content);
+}
+
+function isClaudeCodeRequestFromSystem(system) {
+    const text = getSystemText(system);
+    return text.includes('You are Claude Code') || text.includes("Claude Code, Anthropic's official CLI for Claude");
+}
+
+function hasWebSearchServerTool(tools) {
+    if (!Array.isArray(tools)) return false;
+    return tools.some(t => typeof t?.type === 'string' && t.type.startsWith('web_search_'));
+}
+
+function extractClaudeCodeWebSearchHelperQuery(messages) {
+    if (!Array.isArray(messages) || messages.length !== 1) return null;
+    const msg = messages[0];
+    if (msg?.role !== 'user') return null;
+    const text = contentToText(msg.content).trim();
+    // Claude Code WebSearch helper call format
+    // e.g. "Perform a web search for the query: 今日新闻 2025年12月19日"
+    const prefix = 'Perform a web search for the query:';
+    if (!text.startsWith(prefix)) return null;
+    const query = text.slice(prefix.length).trim();
+    return query || null;
+}
+
+function makePseudoEncryptedContent(input) {
+    const h = createHash('sha256').update(String(input || '')).digest('base64url');
+    // keep it short-ish but non-empty
+    return `E${h.slice(0, 48)}`;
+}
+
+async function handleClaudeCodeWebSearchHelperRequest(request, reply) {
+    const body = request.body || {};
+    const { model, stream = false } = body;
+
+    const query = extractClaudeCodeWebSearchHelperQuery(body.messages);
+    if (!query) return false;
+
+    // Do the actual search server-side (emulating Anthropic web search tool behavior)
+    let search = null;
+    try {
+        search = await searchWeb(query, 5);
+    } catch (e) {
+        search = { success: false, results: [], error: e?.message || String(e) };
+    }
+
+    const srvToolId = `srvtoolu_${createHash('sha1').update(`${Date.now()}|${Math.random()}|${query}`).digest('hex').slice(0, 24)}`;
+    const results = (search?.results || []).map(r => ({
+        type: 'web_search_result',
+        url: r.url || '',
+        title: r.title || r.url || 'Result',
+        encrypted_content: makePseudoEncryptedContent(`${r.title || ''}\n${r.url || ''}\n${r.snippet || ''}`),
+        page_age: ''
+    })).filter(r => r.url);
+
+    const contentBlocks = [
+        {
+            type: 'server_tool_use',
+            id: srvToolId,
+            name: 'web_search',
+            input: { query }
+        },
+        {
+            type: 'web_search_tool_result',
+            tool_use_id: srvToolId,
+            content: results
+        }
+    ];
+
+    const usage = {
+        input_tokens: 0,
+        output_tokens: 0,
+        server_tool_use: { web_search_requests: 1 }
+    };
+
+    if (!stream) {
+        return reply.send({
+            id: `msg_${srvToolId}`,
+            type: 'message',
+            role: 'assistant',
+            model,
+            content: contentBlocks,
+            stop_reason: 'end_turn',
+            stop_sequence: null,
+            usage
+        });
+    }
+
+    // Stream (SSE) response in Anthropic format
+    reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    });
+
+    const messageStart = {
+        type: 'message_start',
+        message: {
+            id: `msg_${srvToolId}`,
+            type: 'message',
+            role: 'assistant',
+            model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0, server_tool_use: { web_search_requests: 1 } }
+        }
+    };
+    reply.raw.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`);
+
+    // 0) server_tool_use block（按文档：start 不带 input，input 通过 input_json_delta 下发）
+    reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'server_tool_use', id: srvToolId, name: 'web_search', input: {} }
+    })}\n\n`);
+    reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify({ query }) }
+    })}\n\n`);
+    reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+
+    // 1) web_search_tool_result block
+    reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'web_search_tool_result', tool_use_id: srvToolId, content: results }
+    })}\n\n`);
+    reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 1 })}\n\n`);
+
+    reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: 0, server_tool_use: { web_search_requests: 1 } }
+    })}\n\n`);
+    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+    reply.raw.end();
+    return true;
+}
+
+function looksLikeEmptyWebSearchResult(content) {
+    const trimmed = contentToText(content).trim();
+    if (!trimmed) return true;
+    // Claude Code WebSearch 常见占位输出：只有 query + REMINDER，但没有任何来源链接
+    const hasAnyLink = trimmed.includes('http://') || trimmed.includes('https://') || trimmed.includes('www.');
+    if (trimmed.startsWith('Web search results for query:') && !hasAnyLink) return true;
+    if (trimmed.includes('REMINDER: You MUST include the sources above') && !hasAnyLink) return true;
+    return false;
+}
+
+function formatSearchResultsMarkdown(query, results) {
+    if (!results?.length) {
+        return `Web search results for query: "${query}"\n\n(No results found.)`;
+    }
+
+    const lines = [];
+    lines.push(`Web search results for query: "${query}"`);
+    lines.push('');
+    for (const r of results) {
+        const title = r.title || r.url || 'Result';
+        const url = r.url || '';
+        const snippet = r.snippet ? ` — ${r.snippet}` : '';
+        if (url) lines.push(`- [${title}](${url})${snippet}`);
+    }
+    return lines.join('\n');
+}
+
+async function patchClaudeCodeEmptyWebSearchToolResults(request) {
+    if (!isClaudeCodeRequestFromSystem(request?.system)) return request;
+    if (!Array.isArray(request?.messages)) return request;
+
+    const toolUseMap = new Map(); // tool_use_id -> { name, input }
+    for (const msg of request.messages) {
+        if (msg?.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+        for (const block of msg.content) {
+            if (block?.type === 'tool_use' && block.id) {
+                toolUseMap.set(block.id, { name: block.name, input: block.input });
+            }
+        }
+    }
+
+    let mutated = false;
+    const patchedMessages = request.messages.map(msg => {
+        if (msg?.role !== 'user' || !Array.isArray(msg.content)) return msg;
+
+        const patchedContent = msg.content.map(block => {
+            if (block?.type !== 'tool_result' || !block.tool_use_id) return block;
+            const toolUse = toolUseMap.get(block.tool_use_id);
+            const toolName = toolUse?.name;
+            if (!toolName) return block;
+
+            const normalizedToolName = String(toolName).toLowerCase().replace(/[^a-z0-9]/g, '');
+            const isWebSearchTool = normalizedToolName === 'websearch';
+            if (!isWebSearchTool) return block;
+
+            if (!looksLikeEmptyWebSearchResult(block.content)) return block;
+
+            const query =
+                (toolUse?.input && typeof toolUse.input.query === 'string' && toolUse.input.query.trim())
+                    ? toolUse.input.query.trim()
+                    : (toolUse?.input && typeof toolUse.input.q === 'string' && toolUse.input.q.trim())
+                        ? toolUse.input.q.trim()
+                        : (toolUse?.input && typeof toolUse.input.search_query === 'string' && toolUse.input.search_query.trim())
+                            ? toolUse.input.search_query.trim()
+                            : (toolUse?.input && typeof toolUse.input.keyword === 'string' && toolUse.input.keyword.trim())
+                                ? toolUse.input.keyword.trim()
+                    : (() => {
+                        const m = contentToText(block.content || '').match(/query:\s*\"([^\"]+)\"/i);
+                        return m?.[1] || 'web search';
+                    })();
+
+            mutated = true;
+            return { ...block, _needs_web_search_patch: true, _web_search_query: query };
+        });
+
+        return mutated ? { ...msg, content: patchedContent } : msg;
+    });
+
+    if (!mutated) return request;
+
+    for (const msg of patchedMessages) {
+        if (msg?.role !== 'user' || !Array.isArray(msg.content)) continue;
+        for (const block of msg.content) {
+            if (!block?._needs_web_search_patch) continue;
+            const query = block._web_search_query || 'web search';
+            try {
+                const search = await searchWeb(query, 5);
+                block.content = formatSearchResultsMarkdown(query, search?.results || []);
+            } catch (e) {
+                block.content = `Web search results for query: "${query}"\n\n(Search failed: ${e?.message || String(e)})`;
+            }
+            delete block._needs_web_search_patch;
+            delete block._web_search_query;
+        }
+    }
+
+    return { ...request, messages: patchedMessages };
+}
 
 export default async function anthropicRoutes(fastify) {
     // POST /v1/messages - Anthropic 格式的聊天端点
@@ -31,9 +307,29 @@ export default async function anthropicRoutes(fastify) {
         let streamEventsForLog = null;
         let errorResponseForLog = null;
 
+        const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
+        const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
+        const isCapacityError = (err) => {
+            const msg = err?.message || '';
+            return (
+                msg.includes('exhausted your capacity on this model') ||
+                msg.includes('Resource has been exhausted') ||
+                err?.upstreamStatus === 429
+            );
+        };
+
         try {
-            // 1. 预处理请求 - 为没有 thinking 块的 assistant 消息添加 redacted_thinking
+            // Claude Code 的 WebSearch 会先发一个“web search helper call”，带上 web_search_20250305 工具。
+            // 官方 Anthropic API 会在服务器侧执行搜索并返回 server_tool_use + web_search_tool_result。
+            // 为了让 Claude Code 的原生 WebSearch 正常工作（不再显示 Did 0 searches），这里直接在代理侧模拟该工具响应。
+            if (isClaudeCodeRequestFromSystem(anthropicRequest?.system) && hasWebSearchServerTool(anthropicRequest?.tools)) {
+                const handled = await handleClaudeCodeWebSearchHelperRequest(request, reply);
+                if (handled) return;
+            }
+
+            // 1. 预处理请求 - 尝试补齐/回放 thinking.signature（仅在无法恢复时才会降级禁用 thinking）
             anthropicRequest = preprocessAnthropicRequest(anthropicRequest);
+            anthropicRequest = await patchClaudeCodeEmptyWebSearchToolResults(anthropicRequest);
 
             // 2. 获取模型并发槽位（避免本地直接打爆上游）
             modelSlotAcquired = acquireModelSlot(model);
@@ -51,19 +347,16 @@ export default async function anthropicRoutes(fastify) {
                 return reply.code(429).send(errorResponseForLog);
             }
 
-            // 3. 获取最优账号
-            account = await accountPool.getBestAccount(model);
-
-            // 4. 转换请求格式
-            const antigravityRequest = convertAnthropicToAntigravity(anthropicRequest, account.project_id);
-            const requestId = antigravityRequest.requestId.replace('agent-', '');
+            // 3/4. 先转换请求格式（requestId 固定），project 在选择账号后再注入，便于容量错误时重试切号
+            const antigravityRequestBase = convertAnthropicToAntigravity(anthropicRequest, '');
+            const requestId = antigravityRequestBase.requestId.replace('agent-', '');
 
             // 5. 流式或非流式处理
             if (stream) {
                 streamEventsForLog = [];
                 // 设置 SSE 响应头 (Anthropic 格式)
                 reply.raw.writeHead(200, {
-                    'Content-Type': 'text/event-stream',
+                    'Content-Type': 'text/event-stream; charset=utf-8',
                     'Cache-Control': 'no-cache',
                     'Connection': 'keep-alive',
                     'X-Accel-Buffering': 'no'
@@ -95,53 +388,90 @@ export default async function anthropicRoutes(fastify) {
                     abortController.abort();
                 });
 
-                let sseState = {};
+                const thinkingEnabledForStream = anthropicRequest.thinking?.type === 'enabled' ||
+                    (anthropicRequest.thinking?.type !== 'disabled' && isThinkingModel(model));
+                let sseState = {
+                    thinkingEnabled: !!thinkingEnabledForStream,
+                    userKey: anthropicRequest?.metadata?.user_id || null
+                };
                 let lastUsage = null;
                 let sawAnyUpstreamEvents = false;
                 let sawAnyContentBlock = false;
 
-                invokedUpstream = true;
-                await streamChat(
-                    account,
-                    antigravityRequest,
-                    (data) => {
-                        // 转换 SSE 数据
-                        const { events, state } = convertAntigravityToAnthropicSSE(
-                            data, requestId, model, sseState
-                        );
-                        sseState = state;
+                try {
+                    let attempt = 0;
+                    while (true) {
+                        attempt++;
+                        account = await accountPool.getBestAccount(model);
 
-                        // 发送所有事件
-                        for (const event of events) {
-                            const eventType = event.type;
-                            sawAnyUpstreamEvents = true;
-                            if (eventType === 'content_block_start' || eventType === 'content_block_delta') {
-                                sawAnyContentBlock = true;
-                            }
-                            streamEventsForLog.push({ event: eventType, data: event });
-                            reply.raw.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+                        const antigravityRequest = structuredClone(antigravityRequestBase);
+                        antigravityRequest.project = account.project_id || '';
 
-                            // 提取 usage
-                            if (event.usage) {
-                                lastUsage = event.usage;
+                        invokedUpstream = true;
+                        try {
+                            await streamChat(
+                                account,
+                                antigravityRequest,
+                                (data) => {
+                                    // 转换 SSE 数据
+                                    const { events, state } = convertAntigravityToAnthropicSSE(
+                                        data, requestId, model, sseState
+                                    );
+                                    sseState = state;
+
+                                    // 发送所有事件
+                                    for (const event of events) {
+                                        const eventType = event.type;
+                                        sawAnyUpstreamEvents = true;
+                                        if (eventType === 'content_block_start' || eventType === 'content_block_delta') {
+                                            sawAnyContentBlock = true;
+                                        }
+                                        streamEventsForLog.push({ event: eventType, data: event });
+                                        reply.raw.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+
+                                        // 提取 usage
+                                        if (event.usage) {
+                                            lastUsage = event.usage;
+                                        }
+                                    }
+                                },
+                                null,
+                                abortController.signal
+                            );
+
+                            // 成功：清除退避计数
+                            accountPool.markCapacityRecovered(account.id, model);
+                            break;
+                        } catch (err) {
+                            if (abortController.signal.aborted) return;
+                            if (account && isCapacityError(err)) {
+                                accountPool.markCapacityLimited(account.id, model, err.message || '');
+                                accountPool.unlockAccount(account.id);
+                                account = null;
+                                // 仅在还没产出任何事件时切号重试
+                                if (!sawAnyUpstreamEvents && attempt <= maxRetries + 1) {
+                                    const resetMs = parseResetAfterMs(err?.message);
+                                    const delay = resetMs ?? (baseRetryDelayMs * attempt);
+                                    await sleep(delay);
+                                    continue;
+                                }
                             }
+                            throw err;
                         }
-                    },
-                    (error) => {
-                        status = 'error';
-                        errorMessage = error.message;
-                        const errorEvent = {
-                            type: 'error',
-                            error: {
-                                type: 'api_error',
-                                message: error.message
-                            }
-                        };
-                        streamEventsForLog.push({ event: 'error', data: errorEvent });
-                        reply.raw.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
-                    },
-                    abortController.signal
-                );
+                    }
+                } catch (err) {
+                    status = 'error';
+                    errorMessage = err.message;
+                    const errorEvent = {
+                        type: 'error',
+                        error: {
+                            type: 'api_error',
+                            message: err.message
+                        }
+                    };
+                    streamEventsForLog.push({ event: 'error', data: errorEvent });
+                    reply.raw.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
+                }
 
                 // 上游有时会返回“HTTP 200 + SSE 结束”但中间没有任何 events（例如安全拦截/空回复）
                 if (status === 'success' && (!sawAnyUpstreamEvents || !sawAnyContentBlock)) {
@@ -171,13 +501,43 @@ export default async function anthropicRoutes(fastify) {
                 responseForLog = { stream: true, events: streamEventsForLog };
             } else {
                 // 非流式请求
-                invokedUpstream = true;
-                const antigravityResponse = await chat(account, antigravityRequest);
+                let antigravityResponse = null;
+                let attempt = 0;
+                while (true) {
+                    attempt++;
+                    account = await accountPool.getBestAccount(model);
+                    const antigravityRequest = structuredClone(antigravityRequestBase);
+                    antigravityRequest.project = account.project_id || '';
+
+                    try {
+                        invokedUpstream = true;
+                        antigravityResponse = await chat(account, antigravityRequest);
+                        accountPool.markCapacityRecovered(account.id, model);
+                        break;
+                    } catch (err) {
+                        if (account && isCapacityError(err)) {
+                            accountPool.markCapacityLimited(account.id, model, err.message || '');
+                            accountPool.unlockAccount(account.id);
+                            account = null;
+                            if (attempt <= maxRetries + 1) {
+                                const resetMs = parseResetAfterMs(err?.message);
+                                const delay = resetMs ?? (baseRetryDelayMs * attempt);
+                                await sleep(delay);
+                                continue;
+                            }
+                        }
+                        throw err;
+                    }
+                }
                 // 检测 thinking 模式 - 显式启用或根据模型名自动启用
                 const thinkingEnabled = anthropicRequest.thinking?.type === 'enabled' ||
                     (anthropicRequest.thinking?.type !== 'disabled' && isThinkingModel(model));
                 const anthropicResponse = convertAntigravityToAnthropic(
-                    antigravityResponse, requestId, model, thinkingEnabled
+                    antigravityResponse,
+                    requestId,
+                    model,
+                    thinkingEnabled,
+                    anthropicRequest?.metadata?.user_id || null
                 );
 
                 usage = {
@@ -194,20 +554,15 @@ export default async function anthropicRoutes(fastify) {
             status = 'error';
             errorMessage = error.message;
 
-            const msg = error.message || '';
-            const isCapacityError =
-                msg.includes('exhausted your capacity on this model') ||
-                msg.includes('Resource has been exhausted');
-
             // 容量耗尽：不把账号标成 error，只做短暂冷却，并返回 429
-            if (account && isCapacityError) {
-                accountPool.markCapacityLimited(account.id, model, msg);
+            if (account && isCapacityError(error)) {
+                accountPool.markCapacityLimited(account.id, model, error.message || '');
             } else if (account) {
                 accountPool.markAccountError(account.id, error);
             }
 
-            const httpStatus = isCapacityError ? 429 : 500;
-            const errorType = isCapacityError ? 'rate_limit_error' : 'api_error';
+            const httpStatus = isCapacityError(error) ? 429 : 500;
+            const errorType = isCapacityError(error) ? 'rate_limit_error' : 'api_error';
 
             // 返回 Anthropic 格式的错误
             errorResponseForLog = {

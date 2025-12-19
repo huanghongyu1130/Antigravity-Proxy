@@ -4,7 +4,8 @@ import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
 // 每个账号允许的最大并发请求数（防止单号被打爆）
 const MAX_CONCURRENT_PER_ACCOUNT = Number(process.env.MAX_CONCURRENT_PER_ACCOUNT || 1);
 // 容量耗尽后的默认冷却时间（毫秒），如果上游返回了具体秒数，会在此基础上调整
-const CAPACITY_COOLDOWN_DEFAULT_MS = Number(process.env.CAPACITY_COOLDOWN_DEFAULT_MS || 3000);
+const CAPACITY_COOLDOWN_DEFAULT_MS = Number(process.env.CAPACITY_COOLDOWN_DEFAULT_MS || 15000);
+const CAPACITY_COOLDOWN_MAX_MS = Number(process.env.CAPACITY_COOLDOWN_MAX_MS || 120000);
 
 /**
  * 账号池管理类
@@ -15,6 +16,7 @@ class AccountPool {
         this.lastAccountIndex = -1;
         this.accountLocks = new Map(); // 账号锁，防止并发问题（值为当前并发计数）
         this.capacityCooldowns = new Map(); // 账号在某个模型上的冷却期 key: `${accountId}:${model}` -> timestamp
+        this.capacityErrorCounts = new Map(); // 连续容量错误计数 key: `${accountId}:${model}` -> count
     }
 
     /**
@@ -145,6 +147,16 @@ class AccountPool {
         if (!accountId || !model) return;
 
         let cooldownMs = CAPACITY_COOLDOWN_DEFAULT_MS;
+        const key = `${accountId}:${model}`;
+        const prev = this.capacityErrorCounts.get(key) || 0;
+        const next = prev + 1;
+        this.capacityErrorCounts.set(key, next);
+
+        // 指数退避：默认冷却 * 2^(n-1)，上限 CAPACITY_COOLDOWN_MAX_MS
+        if (CAPACITY_COOLDOWN_DEFAULT_MS > 0) {
+            const backoff = CAPACITY_COOLDOWN_DEFAULT_MS * (2 ** Math.max(0, next - 1));
+            cooldownMs = Math.min(CAPACITY_COOLDOWN_MAX_MS, backoff);
+        }
 
         // 尝试从错误信息中解析 reset 秒数
         if (typeof message === 'string') {
@@ -158,9 +170,17 @@ class AccountPool {
             }
         }
 
-        const key = `${accountId}:${model}`;
         const until = Date.now() + cooldownMs;
         this.capacityCooldowns.set(key, until);
+    }
+
+    /**
+     * 成功调用后清除该模型的容量错误退避计数
+     */
+    markCapacityRecovered(accountId, model) {
+        if (!accountId || !model) return;
+        const key = `${accountId}:${model}`;
+        this.capacityErrorCounts.delete(key);
     }
 
     /**

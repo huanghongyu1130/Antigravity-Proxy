@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at INTEGER
 );
 
+-- Signature 缓存（用于 Claude extended thinking / tool signature 回放，避免客户端不回放导致上游校验失败）
+CREATE TABLE IF NOT EXISTS signature_cache (
+    kind TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    saved_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, cache_key)
+);
+
 -- 创建索引
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 CREATE INDEX IF NOT EXISTS idx_accounts_quota ON accounts(quota_remaining);
@@ -60,3 +69,4 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_request_logs_account ON request_logs(account_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
 CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
+CREATE INDEX IF NOT EXISTS idx_signature_cache_saved_at ON signature_cache(saved_at);

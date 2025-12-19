@@ -263,6 +263,7 @@ export async function searchWeb(query, maxResults = 5) {
 
     // 依次尝试多个搜索源
     const searchMethods = [
+        () => searchWithGoogleNewsRss(query, maxResults),
         () => searchWithDuckDuckGoAPI(query, maxResults),
         () => searchWithWikipedia(query, maxResults)
     ];
@@ -283,6 +284,49 @@ export async function searchWeb(query, maxResults = 5) {
         error: 'All search methods failed',
         query,
         results: []
+    };
+}
+
+/**
+ * Google News RSS（无需 API key，适合新闻类查询）
+ */
+async function searchWithGoogleNewsRss(query, maxResults) {
+    // 备注：News RSS 会自动聚合多来源；这里固定用 US 英文源保证可用性
+    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
+
+    const response = await fetch(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; WebSearchBot/1.0)',
+            'Accept': 'application/rss+xml, application/xml, text/xml'
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`Google News RSS failed: ${response.status}`);
+    }
+
+    const xml = await response.text();
+    const results = [];
+
+    // 非严格 XML 解析：提取 <item>...</item>
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+    let match;
+    while ((match = itemRegex.exec(xml)) !== null && results.length < maxResults) {
+        const item = match[1];
+        const title = cleanHtml((item.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i)?.[1] || item.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || '').trim());
+        const link = cleanHtml((item.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || '').trim());
+        const descRaw = item.match(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/i)?.[1] || item.match(/<description>([\s\S]*?)<\/description>/i)?.[1] || '';
+        const snippet = cleanHtml(descRaw);
+
+        if (!link) continue;
+        results.push({ title: title || link, url: link, snippet });
+    }
+
+    return {
+        success: results.length > 0,
+        query,
+        results,
+        resultCount: results.length
     };
 }
 
@@ -428,14 +472,24 @@ function parseSearchResults(html, maxResults) {
  */
 function cleanHtml(text) {
     if (!text) return '';
-    return text
-        .replace(/<[^>]+>/g, '')
+    // 注意：某些来源（如 Google News RSS description）会把 HTML 标签先实体化成 &lt;...&gt;。
+    // 如果先 strip 标签再 decode 实体，会把标签“解码回来”，导致输出仍带 HTML。
+    // 因此这里先 decode 常见实体，再 strip 标签。
+    // 备注：先处理 &amp;，否则像 &amp;nbsp; 会在后续阶段变成 &nbsp; 而错过替换。
+    const decoded = String(text)
         .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/\u00a0/g, ' ')
+        .replace(/&quot;/gi, '"')
         .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, ' ')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        // 二次兜底：处理 &amp;nbsp; -> (&)nbsp; 的情况
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/\u00a0/g, ' ');
+
+    return decoded
+        .replace(/<[^>]+>/g, '')
         .replace(/\s+/g, ' ')
         .trim();
 }
