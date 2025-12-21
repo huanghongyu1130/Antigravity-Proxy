@@ -6,10 +6,12 @@
 
 - **OpenAI 兼容**：`/v1/chat/completions`、`/v1/models`（支持流式、工具调用、多模态）
 - **Anthropic 兼容**：`/v1/messages`（支持流式、`tool_use/tool_result`）
+- **Gemini 原生兼容（v1beta）**：`/v1beta/models`、`/v1beta/models/{model}:(generateContent|streamGenerateContent|countTokens)`（支持透传 `generationConfig.imageConfig` 等原生字段）
 - **管理面板**：账号池（OAuth/手动 refresh_token）、API Keys、请求日志、模型/今日统计
 - **稳定性增强**：按模型/按账号并发限制 + 上游容量错误退避/切号重试（减少 `Resource has been exhausted`）
 - **Claude thinking + tools 兼容**：
   - 自动缓存/回放 `thinking.signature`（Anthropic 端点：落库持久化；OpenAI 端点：代理内缓存回放）
+
 ## 快速开始
 
 ### 方式 A：Docker（部署推荐）
@@ -31,6 +33,7 @@ docker compose up -d --build
 
 - 管理面板：`http://127.0.0.1:${PORT:-8088}`
 - API Base：`http://127.0.0.1:${PORT:-8088}/v1`
+- Gemini Base：`http://127.0.0.1:${PORT:-8088}/v1beta`
 - 健康检查：`http://127.0.0.1:${PORT:-8088}/health`
 
 > Docker 默认会把数据库持久化到 `./data/database.sqlite`（见 `docker-compose.yml` 的 volume）。
