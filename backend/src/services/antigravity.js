@@ -183,6 +183,47 @@ export async function chat(account, request) {
 }
 
 /**
+ * 计算 tokens（v1internal:countTokens）
+ * @param {Object} account - 账号信息（包含 access_token）
+ * @param {Object} request - countTokens 请求体（通常为 { request: { model, contents } }）
+ */
+export async function countTokens(account, request) {
+    const url = `${BASE_URL}/v1internal:countTokens`;
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${account.access_token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': USER_AGENT
+        },
+        body: JSON.stringify(request)
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = `API Error: ${response.status}`;
+        let parsed = null;
+
+        try {
+            const errorJson = JSON.parse(errorText);
+            parsed = errorJson;
+            errorMessage = errorJson.error?.message || errorMessage;
+        } catch {
+            errorMessage = errorText || errorMessage;
+        }
+
+        const err = new Error(errorMessage);
+        err.upstreamStatus = response.status;
+        if (parsed) err.upstreamJson = parsed;
+        err.upstreamBody = errorText;
+        throw err;
+    }
+
+    return response.json();
+}
+
+/**
  * 获取可用模型列表
  */
 export async function fetchAvailableModels(account) {

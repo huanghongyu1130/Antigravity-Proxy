@@ -13,6 +13,7 @@ export async function verifyApiKey(request, reply) {
     const xApiKey = request.headers['x-api-key'];
     const anthropicApiKey = request.headers['anthropic-api-key'];
     const xGoogApiKey = request.headers['x-goog-api-key'];
+    const queryKey = request?.query && typeof request.query === 'object' ? request.query.key : null;
 
     let apiKey = null;
 
@@ -38,6 +39,10 @@ export async function verifyApiKey(request, reply) {
             });
         }
         apiKey = authHeader.slice(7);
+    }
+    // 兼容 Gemini 官方：?key=<api_key>
+    else if (queryKey) {
+        apiKey = Array.isArray(queryKey) ? queryKey[0] : queryKey;
     }
     // 没有任何认证信息
     else {

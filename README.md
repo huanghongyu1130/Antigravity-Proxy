@@ -205,7 +205,13 @@ curl "http://localhost:8088/v1/models" -H "Authorization: Bearer sk-your-api-key
 
 ## Gemini 原生端点（v1beta，主要用于 Image 生成）
 
-本项目额外提供了一个 **Gemini 原生**兼容端点（最小实现），用于 `gemini-3-pro-image` 等场景透传 `generationConfig.imageConfig`。
+本项目额外提供了一个 **Gemini 原生**兼容端点（最小实现），用于 `gemini-3-pro-image` 等场景透传 `generationConfig.imageConfig`，也可用于其它 Gemini 模型的原生调用。
+
+- 鉴权：支持 `x-goog-api-key` / `x-api-key` / `Authorization: Bearer`，也兼容 Gemini 官方的 `?key=...`
+- `:streamGenerateContent`：
+  - `?alt=sse`（或 `Accept: text/event-stream`）时返回 SSE，并在结束时输出 `data: [DONE]`
+  - 否则返回 JSON 数组（每个元素是一次流式 chunk 的 payload）
+- `:countTokens`：已支持（透传到上游 `v1internal:countTokens`）
 
 ### Image 生成（`gemini-3-pro-image`）
 

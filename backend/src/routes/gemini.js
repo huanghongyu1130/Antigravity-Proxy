@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { verifyApiKey, recordApiKeyUsage } from '../middleware/auth.js';
 import { accountPool } from '../services/accountPool.js';
 import { acquireModelSlot, releaseModelSlot } from '../services/rateLimiter.js';
-import { streamChat, chat, fetchAvailableModels } from '../services/antigravity.js';
+import { streamChat, chat, countTokens, fetchAvailableModels } from '../services/antigravity.js';
 import { createRequestLog } from '../db/index.js';
 import { getMappedModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
@@ -175,13 +175,18 @@ export default async function geminiRoutes(fastify) {
 
             const modelFromPath = decodedRest.slice(0, sep);
             const action = decodedRest.slice(sep + 1);
-            if (action !== 'generateContent' && action !== 'streamGenerateContent') {
+            if (action !== 'generateContent' && action !== 'streamGenerateContent' && action !== 'countTokens') {
                 return reply.code(404).send({
                     error: { message: `Not Found: POST /v1beta/models/${decodedRest}` }
                 });
             }
 
             const stream = action === 'streamGenerateContent';
+            const isCountTokens = action === 'countTokens';
+            const wantsSse =
+                stream &&
+                (String(request.query?.alt || '').toLowerCase() === 'sse' ||
+                    String(request.headers.accept || '').toLowerCase().includes('text/event-stream'));
 
             const requestedModel = modelFromPath.startsWith('models/')
                 ? modelFromPath.slice('models/'.length)
@@ -230,6 +235,45 @@ export default async function geminiRoutes(fastify) {
                         ? structuredClone(rawBody.request)
                         : structuredClone(rawBody);
 
+                if (isCountTokens) {
+                    const countTokensBody = {
+                        request: {
+                            model,
+                            contents: Array.isArray(innerRequest.contents) ? innerRequest.contents : []
+                        }
+                    };
+
+                    let countTokensResp = null;
+                    let attempt = 0;
+
+                    while (true) {
+                        attempt++;
+                        account = await accountPool.getBestAccount(model);
+                        try {
+                            invokedUpstream = true;
+                            countTokensResp = await countTokens(account, countTokensBody);
+                            accountPool.markCapacityRecovered(account.id, model);
+                            break;
+                        } catch (err) {
+                            if (account && isCapacityError(err)) {
+                                accountPool.markCapacityLimited(account.id, model, err.message || '');
+                                accountPool.unlockAccount(account.id);
+                                account = null;
+                                if (attempt <= maxRetries + 1) {
+                                    const resetMs = parseResetAfterMs(err?.message);
+                                    const delay = resetMs ?? (baseRetryDelayMs * attempt);
+                                    await sleep(delay);
+                                    continue;
+                                }
+                            }
+                            throw err;
+                        }
+                    }
+
+                    responseForLog = countTokensResp;
+                    return reply.code(200).send(countTokensResp);
+                }
+
                 // 透传 generationConfig（包括 imageConfig），仅补最小默认值
                 if (!innerRequest.generationConfig || typeof innerRequest.generationConfig !== 'object') {
                     innerRequest.generationConfig = {};
@@ -254,12 +298,15 @@ export default async function geminiRoutes(fastify) {
 
                 if (stream) {
                     streamChunksForLog = [];
-                    reply.raw.writeHead(200, {
-                        'Content-Type': 'text/event-stream',
-                        'Cache-Control': 'no-cache',
-                        'Connection': 'keep-alive',
-                        'X-Accel-Buffering': 'no'
-                    });
+                    const chunksForClient = [];
+                    if (wantsSse) {
+                        reply.raw.writeHead(200, {
+                            'Content-Type': 'text/event-stream',
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive',
+                            'X-Accel-Buffering': 'no'
+                        });
+                    }
 
                     const abortController = new AbortController();
                     request.raw.on('close', () => abortController.abort());
@@ -295,7 +342,10 @@ export default async function geminiRoutes(fastify) {
                                                 };
                                             }
                                             streamChunksForLog.push(unwrapped);
-                                            reply.raw.write(`data: ${JSON.stringify(unwrapped)}\n\n`);
+                                            chunksForClient.push(unwrapped);
+                                            if (wantsSse) {
+                                                reply.raw.write(`data: ${JSON.stringify(unwrapped)}\n\n`);
+                                            }
                                         } catch {
                                             // 非 JSON chunk：忽略
                                         }
@@ -327,7 +377,9 @@ export default async function geminiRoutes(fastify) {
                         errorMessage = err.message;
                         const errorChunk = { error: { message: err.message, type: 'api_error' } };
                         errorResponseForLog = errorChunk;
-                        reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                        if (wantsSse) {
+                            reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                        }
                     }
 
                     if (status === 'success' && !sawAnyData) {
@@ -335,14 +387,24 @@ export default async function geminiRoutes(fastify) {
                         errorMessage = 'Upstream returned empty response (no events)';
                         const errorChunk = { error: { message: errorMessage, type: 'api_error', code: 'empty_upstream_response' } };
                         errorResponseForLog = errorChunk;
-                        reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                        if (wantsSse) {
+                            reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                        }
                     }
-
-                    reply.raw.end();
 
                     usage = lastUsage;
                     responseForLog = { stream: true, chunks: streamChunksForLog };
-                    return;
+                    if (wantsSse) {
+                        reply.raw.write('data: [DONE]\n\n');
+                        reply.raw.end();
+                        return;
+                    }
+
+                    if (status === 'success') {
+                        return reply.code(200).send(chunksForClient);
+                    }
+
+                    return reply.code(500).send(errorResponseForLog || { error: { message: errorMessage || 'Unknown error', type: 'api_error' } });
                 }
 
                 // 非流式
