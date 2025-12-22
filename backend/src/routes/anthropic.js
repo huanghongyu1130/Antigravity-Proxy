@@ -13,20 +13,8 @@ import { isThinkingModel, AVAILABLE_MODELS } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
 import { searchWeb } from '../services/webSearch.js';
 import { createHash } from 'crypto';
-
-function parseResetAfterMs(message) {
-    if (!message) return null;
-    const m = String(message).match(/reset after (\\d+)s/i);
-    if (!m) return null;
-    const seconds = Number.parseInt(m[1], 10);
-    if (!Number.isFinite(seconds) || seconds < 0) return null;
-    return (seconds + 1) * 1000;
-}
-
-function sleep(ms) {
-    if (!ms || ms <= 0) return Promise.resolve();
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { isCapacityError, SSE_HEADERS_ANTHROPIC } from '../utils/route-helpers.js';
+import { createAbortController, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
 
 function getSystemText(system) {
     if (!system) return '';
@@ -136,12 +124,7 @@ async function handleClaudeCodeWebSearchHelperRequest(request, reply) {
     }
 
     // Stream (SSE) response in Anthropic format
-    reply.raw.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    });
+    reply.raw.writeHead(200, SSE_HEADERS_ANTHROPIC);
 
     const messageStart = {
         type: 'message_start',
@@ -324,15 +307,6 @@ export default async function anthropicRoutes(fastify) {
 
         const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
         const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
-        const isCapacityError = (err) => {
-            const msg = err?.message || '';
-            return (
-                msg.includes('exhausted your capacity on this model') ||
-                msg.includes('Resource has been exhausted') ||
-                msg.includes('No capacity available') ||
-                err?.upstreamStatus === 429
-            );
-        };
 
         try {
             // Claude Code 的 WebSearch 会先发一个“web search helper call”，带上 web_search_20250305 工具。
@@ -371,12 +345,7 @@ export default async function anthropicRoutes(fastify) {
             if (stream) {
                 streamEventsForLog = [];
                 // 设置 SSE 响应头 (Anthropic 格式)
-                reply.raw.writeHead(200, {
-                    'Content-Type': 'text/event-stream; charset=utf-8',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive',
-                    'X-Accel-Buffering': 'no'
-                });
+                    reply.raw.writeHead(200, SSE_HEADERS_ANTHROPIC);
 
                 // 发送 message_start 事件
                 const messageStart = {
@@ -398,11 +367,7 @@ export default async function anthropicRoutes(fastify) {
                 streamEventsForLog.push({ event: 'message_start', data: messageStart });
                 reply.raw.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`);
 
-                // 处理客户端断开
-                const abortController = new AbortController();
-                request.raw.on('close', () => {
-                    abortController.abort();
-                });
+                const abortController = createAbortController(request);
 
                 const thinkingEnabledForStream = anthropicRequest.thinking?.type === 'enabled' ||
                     (anthropicRequest.thinking?.type !== 'disabled' && isThinkingModel(model));
@@ -415,67 +380,48 @@ export default async function anthropicRoutes(fastify) {
                 let sawAnyContentBlock = false;
 
                 try {
-                    let attempt = 0;
-                    while (true) {
-                        attempt++;
-                        account = await accountPool.getBestAccount(model);
-
-                        const antigravityRequest = structuredClone(antigravityRequestBase);
-                        antigravityRequest.project = account.project_id || '';
-
-                        invokedUpstream = true;
-                        try {
-                            await streamChat(
-                                account,
-                                antigravityRequest,
-                                (data) => {
-                                    // 转换 SSE 数据
-                                    const { events, state } = convertAntigravityToAnthropicSSE(
-                                        data, requestId, model, sseState
-                                    );
-                                    sseState = state;
-
-                                    // 发送所有事件
-                                    for (const event of events) {
-                                        const eventType = event.type;
-                                        sawAnyUpstreamEvents = true;
-                                        if (eventType === 'content_block_start' || eventType === 'content_block_delta') {
-                                            sawAnyContentBlock = true;
-                                        }
-                                        streamEventsForLog.push({ event: eventType, data: event });
-                                        reply.raw.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
-
-                                        // 提取 usage
-                                        if (event.usage) {
-                                            lastUsage = event.usage;
-                                        }
-                                    }
-                                },
-                                null,
-                                abortController.signal
+                    const out = await runStreamChatWithCapacityRetry({
+                        model,
+                        maxRetries,
+                        baseRetryDelayMs,
+                        accountPool,
+                        buildRequest: (a) => {
+                            const req = structuredClone(antigravityRequestBase);
+                            req.project = a.project_id || '';
+                            return req;
+                        },
+                        streamChat: async (a, req, onData, onError, signal) => {
+                            invokedUpstream = true;
+                            return streamChat(a, req, onData, onError, signal);
+                        },
+                        onData: (data) => {
+                            const { events, state } = convertAntigravityToAnthropicSSE(
+                                data, requestId, model, sseState
                             );
+                            sseState = state;
 
-                            // 成功：清除退避计数
-                            accountPool.markCapacityRecovered(account.id, model);
-                            break;
-                        } catch (err) {
-                            if (abortController.signal.aborted) return;
-                            if (account && isCapacityError(err)) {
-                                accountPool.markCapacityLimited(account.id, model, err.message || '');
-                                accountPool.unlockAccount(account.id);
-                                account = null;
-                                // 仅在还没产出任何事件时切号重试
-                                if (!sawAnyUpstreamEvents && attempt <= maxRetries + 1) {
-                                    const resetMs = parseResetAfterMs(err?.message);
-                                    const delay = resetMs ?? (baseRetryDelayMs * attempt);
-                                    await sleep(delay);
-                                    continue;
+                            for (const event of events) {
+                                const eventType = event.type;
+                                sawAnyUpstreamEvents = true;
+                                if (eventType === 'content_block_start' || eventType === 'content_block_delta') {
+                                    sawAnyContentBlock = true;
+                                }
+                                streamEventsForLog.push({ event: eventType, data: event });
+                                reply.raw.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+
+                                if (event.usage) {
+                                    lastUsage = event.usage;
                                 }
                             }
-                            throw err;
-                        }
-                    }
+                        },
+                        abortSignal: abortController.signal,
+                        canRetry: () => !sawAnyUpstreamEvents
+                    });
+
+                    account = out.account;
+                    if (out.aborted) return;
                 } catch (err) {
+                    if (err?.account) account = err.account;
                     status = 'error';
                     errorMessage = err.message;
                     const errorEvent = {
@@ -539,34 +485,23 @@ export default async function anthropicRoutes(fastify) {
                 responseForLog = { stream: true, events: streamEventsForLog };
             } else {
                 // 非流式请求
-                let antigravityResponse = null;
-                let attempt = 0;
-                while (true) {
-                    attempt++;
-                    account = await accountPool.getBestAccount(model);
-                    const antigravityRequest = structuredClone(antigravityRequestBase);
-                    antigravityRequest.project = account.project_id || '';
-
-                    try {
+                const out = await runChatWithCapacityRetry({
+                    model,
+                    maxRetries,
+                    baseRetryDelayMs,
+                    accountPool,
+                    buildRequest: (a) => {
+                        const req = structuredClone(antigravityRequestBase);
+                        req.project = a.project_id || '';
+                        return req;
+                    },
+                    execute: async (a, req) => {
                         invokedUpstream = true;
-                        antigravityResponse = await chat(account, antigravityRequest);
-                        accountPool.markCapacityRecovered(account.id, model);
-                        break;
-                    } catch (err) {
-                        if (account && isCapacityError(err)) {
-                            accountPool.markCapacityLimited(account.id, model, err.message || '');
-                            accountPool.unlockAccount(account.id);
-                            account = null;
-                            if (attempt <= maxRetries + 1) {
-                                const resetMs = parseResetAfterMs(err?.message);
-                                const delay = resetMs ?? (baseRetryDelayMs * attempt);
-                                await sleep(delay);
-                                continue;
-                            }
-                        }
-                        throw err;
+                        return chat(a, req);
                     }
-                }
+                });
+                account = out.account;
+                const antigravityResponse = out.result;
                 // 检测 thinking 模式 - 显式启用或根据模型名自动启用
                 const thinkingEnabled = anthropicRequest.thinking?.type === 'enabled' ||
                     (anthropicRequest.thinking?.type !== 'disabled' && isThinkingModel(model));
@@ -589,6 +524,7 @@ export default async function anthropicRoutes(fastify) {
                 return responseForLog;
             }
         } catch (error) {
+            if (error?.account) account = error.account;
             status = 'error';
             errorMessage = error.message;
 

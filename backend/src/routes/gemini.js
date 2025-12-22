@@ -7,6 +7,8 @@ import { streamChat, chat, countTokens, fetchAvailableModels } from '../services
 import { createRequestLog } from '../db/index.js';
 import { getMappedModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
+import { isCapacityError, SSE_HEADERS } from '../utils/route-helpers.js';
+import { createAbortController, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
 
 function generateSessionId() {
     return String(-Math.floor(Math.random() * 9e18));
@@ -19,20 +21,6 @@ function unwrapAntigravityResponse(payload) {
         return merged;
     }
     return payload;
-}
-
-function parseResetAfterMs(message) {
-    if (!message) return null;
-    const m = String(message).match(/reset after (\\d+)s/i);
-    if (!m) return null;
-    const seconds = Number.parseInt(m[1], 10);
-    if (!Number.isFinite(seconds) || seconds < 0) return null;
-    return (seconds + 1) * 1000;
-}
-
-function sleep(ms) {
-    if (!ms || ms <= 0) return Promise.resolve();
-    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function parseModelsFromFetchAvailableModels(payload) {
@@ -205,15 +193,6 @@ export default async function geminiRoutes(fastify) {
 
             const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
             const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
-            const isCapacityError = (err) => {
-                const msg = err?.message || '';
-                return (
-                    msg.includes('exhausted your capacity on this model') ||
-                    msg.includes('Resource has been exhausted') ||
-                    msg.includes('No capacity available') ||
-                    err?.upstreamStatus === 429
-                );
-            };
 
             try {
                 modelSlotAcquired = acquireModelSlot(model);
@@ -243,35 +222,21 @@ export default async function geminiRoutes(fastify) {
                         }
                     };
 
-                    let countTokensResp = null;
-                    let attempt = 0;
-
-                    while (true) {
-                        attempt++;
-                        account = await accountPool.getBestAccount(model);
-                        try {
+                    const out = await runChatWithCapacityRetry({
+                        model,
+                        maxRetries,
+                        baseRetryDelayMs,
+                        accountPool,
+                        buildRequest: () => countTokensBody,
+                        execute: async (a, req) => {
                             invokedUpstream = true;
-                            countTokensResp = await countTokens(account, countTokensBody);
-                            accountPool.markCapacityRecovered(account.id, model);
-                            break;
-                        } catch (err) {
-                            if (account && isCapacityError(err)) {
-                                accountPool.markCapacityLimited(account.id, model, err.message || '');
-                                accountPool.unlockAccount(account.id);
-                                account = null;
-                                if (attempt <= maxRetries + 1) {
-                                    const resetMs = parseResetAfterMs(err?.message);
-                                    const delay = resetMs ?? (baseRetryDelayMs * attempt);
-                                    await sleep(delay);
-                                    continue;
-                                }
-                            }
-                            throw err;
+                            return countTokens(a, req);
                         }
-                    }
+                    });
 
-                    responseForLog = countTokensResp;
-                    return reply.code(200).send(countTokensResp);
+                    account = out.account;
+                    responseForLog = out.result;
+                    return reply.code(200).send(out.result);
                 }
 
                 // 透传 generationConfig（包括 imageConfig），仅补最小默认值
@@ -300,79 +265,60 @@ export default async function geminiRoutes(fastify) {
                     streamChunksForLog = [];
                     const chunksForClient = [];
                     if (wantsSse) {
-                        reply.raw.writeHead(200, {
-                            'Content-Type': 'text/event-stream',
-                            'Cache-Control': 'no-cache',
-                            'Connection': 'keep-alive',
-                            'X-Accel-Buffering': 'no'
-                        });
+                        reply.raw.writeHead(200, SSE_HEADERS);
                     }
 
-                    const abortController = new AbortController();
-                    request.raw.on('close', () => abortController.abort());
+                    const abortController = createAbortController(request);
 
                     let lastUsage = null;
                     let sawAnyData = false;
 
                     try {
-                        let attempt = 0;
-                        while (true) {
-                            attempt++;
-                            account = await accountPool.getBestAccount(model);
-                            const antigravityRequest = structuredClone(antigravityRequestBase);
-                            antigravityRequest.project = account.project_id || '';
-
-                            invokedUpstream = true;
-                            try {
-                                await streamChat(
-                                    account,
-                                    antigravityRequest,
-                                    (data) => {
-                                        sawAnyData = true;
-                                        try {
-                                            const parsed = JSON.parse(data);
-                                            const unwrapped = unwrapAntigravityResponse(parsed);
-                                            const usageMetadata = unwrapped?.usageMetadata;
-                                            if (usageMetadata) {
-                                                lastUsage = {
-                                                    promptTokens: usageMetadata.promptTokenCount || 0,
-                                                    completionTokens: usageMetadata.candidatesTokenCount || 0,
-                                                    totalTokens: usageMetadata.totalTokenCount || 0,
-                                                    thinkingTokens: usageMetadata.thoughtsTokenCount || 0
-                                                };
-                                            }
-                                            streamChunksForLog.push(unwrapped);
-                                            chunksForClient.push(unwrapped);
-                                            if (wantsSse) {
-                                                reply.raw.write(`data: ${JSON.stringify(unwrapped)}\n\n`);
-                                            }
-                                        } catch {
-                                            // 非 JSON chunk：忽略
-                                        }
-                                    },
-                                    null,
-                                    abortController.signal
-                                );
-
-                                accountPool.markCapacityRecovered(account.id, model);
-                                break;
-                            } catch (err) {
-                                if (abortController.signal.aborted) return;
-                                if (account && isCapacityError(err)) {
-                                    accountPool.markCapacityLimited(account.id, model, err.message || '');
-                                    accountPool.unlockAccount(account.id);
-                                    account = null;
-                                    if (attempt <= maxRetries + 1 && streamChunksForLog.length === 0) {
-                                        const resetMs = parseResetAfterMs(err?.message);
-                                        const delay = resetMs ?? (baseRetryDelayMs * attempt);
-                                        await sleep(delay);
-                                        continue;
+                        const out = await runStreamChatWithCapacityRetry({
+                            model,
+                            maxRetries,
+                            baseRetryDelayMs,
+                            accountPool,
+                            buildRequest: (a) => {
+                                const req = structuredClone(antigravityRequestBase);
+                                req.project = a.project_id || '';
+                                return req;
+                            },
+                            streamChat: async (a, req, onData, onError, signal) => {
+                                invokedUpstream = true;
+                                return streamChat(a, req, onData, onError, signal);
+                            },
+                            onData: (data) => {
+                                sawAnyData = true;
+                                try {
+                                    const parsed = JSON.parse(data);
+                                    const unwrapped = unwrapAntigravityResponse(parsed);
+                                    const usageMetadata = unwrapped?.usageMetadata;
+                                    if (usageMetadata) {
+                                        lastUsage = {
+                                            promptTokens: usageMetadata.promptTokenCount || 0,
+                                            completionTokens: usageMetadata.candidatesTokenCount || 0,
+                                            totalTokens: usageMetadata.totalTokenCount || 0,
+                                            thinkingTokens: usageMetadata.thoughtsTokenCount || 0
+                                        };
                                     }
+                                    streamChunksForLog.push(unwrapped);
+                                    chunksForClient.push(unwrapped);
+                                    if (wantsSse) {
+                                        reply.raw.write(`data: ${JSON.stringify(unwrapped)}\n\n`);
+                                    }
+                                } catch {
+                                    // 非 JSON chunk：忽略
                                 }
-                                throw err;
-                            }
-                        }
+                            },
+                            abortSignal: abortController.signal,
+                            canRetry: () => streamChunksForLog.length === 0
+                        });
+
+                        account = out.account;
+                        if (out.aborted) return;
                     } catch (err) {
+                        if (err?.account) account = err.account;
                         status = 'error';
                         errorMessage = err.message;
                         const errorChunk = { error: { message: err.message, type: 'api_error' } };
@@ -408,36 +354,24 @@ export default async function geminiRoutes(fastify) {
                 }
 
                 // 非流式
-                let antigravityResponse = null;
-                let attempt = 0;
-                while (true) {
-                    attempt++;
-                    account = await accountPool.getBestAccount(model);
-                    const antigravityRequest = structuredClone(antigravityRequestBase);
-                    antigravityRequest.project = account.project_id || '';
-
-                    try {
+                const out = await runChatWithCapacityRetry({
+                    model,
+                    maxRetries,
+                    baseRetryDelayMs,
+                    accountPool,
+                    buildRequest: (a) => {
+                        const req = structuredClone(antigravityRequestBase);
+                        req.project = a.project_id || '';
+                        return req;
+                    },
+                    execute: async (a, req) => {
                         invokedUpstream = true;
-                        antigravityResponse = await chat(account, antigravityRequest);
-                        accountPool.markCapacityRecovered(account.id, model);
-                        break;
-                    } catch (err) {
-                        if (account && isCapacityError(err)) {
-                            accountPool.markCapacityLimited(account.id, model, err.message || '');
-                            accountPool.unlockAccount(account.id);
-                            account = null;
-                            if (attempt <= maxRetries + 1) {
-                                const resetMs = parseResetAfterMs(err?.message);
-                                const delay = resetMs ?? (baseRetryDelayMs * attempt);
-                                await sleep(delay);
-                                continue;
-                            }
-                        }
-                        throw err;
+                        return chat(a, req);
                     }
-                }
+                });
 
-                const unwrapped = unwrapAntigravityResponse(antigravityResponse);
+                account = out.account;
+                const unwrapped = unwrapAntigravityResponse(out.result);
                 const usageMetadata = unwrapped?.usageMetadata;
                 usage = usageMetadata
                     ? {
@@ -451,6 +385,7 @@ export default async function geminiRoutes(fastify) {
                 responseForLog = unwrapped;
                 return reply.code(200).send(unwrapped);
             } catch (error) {
+                if (error?.account) account = error.account;
                 status = 'error';
                 errorMessage = error.message;
 
