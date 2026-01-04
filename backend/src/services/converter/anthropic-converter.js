@@ -557,6 +557,11 @@ function convertAnthropicTool(tool, isClaudeModel = false) {
 export function convertAntigravityToAnthropic(antigravityResponse, requestId, model, thinkingEnabled = false, userKey = null) {
     try {
         const data = antigravityResponse;
+        const upstreamError = data?.error || data?.response?.error;
+        if (upstreamError) {
+            const message = upstreamError?.message || upstreamError?.error?.message || JSON.stringify(upstreamError);
+            throw new Error(message || 'Upstream returned an error');
+        }
         const candidate = data.response?.candidates?.[0];
         const usage = data.response?.usageMetadata;
 
@@ -566,7 +571,16 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
             if (blockReason) {
                 throw new Error(`Upstream blocked request: ${blockReason}`);
             }
-            throw new Error('Upstream returned no candidates');
+            // 包含更多上游响应信息帮助排查
+            const finishReason = data.response?.candidates?.[0]?.finishReason;
+            const safetyRatings = promptFeedback?.safetyRatings;
+            let detail = 'Upstream returned no candidates';
+            if (finishReason) detail += ` (finishReason: ${finishReason})`;
+            if (safetyRatings) detail += ` (safetyRatings: ${JSON.stringify(safetyRatings)})`;
+            if (!finishReason && !safetyRatings && data.response) {
+                detail += ` (response: ${JSON.stringify(data.response).slice(0, 500)})`;
+            }
+            throw new Error(detail);
         }
 
         const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
