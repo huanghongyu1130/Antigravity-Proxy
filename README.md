@@ -65,7 +65,7 @@ curl "http://localhost:8088/v1/chat/completions" \
 
 说明：
 - 上游可能要求回放工具调用链路的 `thoughtSignature`；本代理会自动缓存并在下一轮回放补齐。
-- Claude 模型在 tool_call 上会自动带 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底（不再插入空文本占位）。
+- Claude 模型在 tool_call 上会自动带 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底。
 
 示例（两轮）：
 
