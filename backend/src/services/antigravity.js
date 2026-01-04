@@ -231,7 +231,17 @@ export async function chat(account, request) {
         throw err;
     }
 
-    return response.json();
+    const data = await response.json();
+    const upstreamError = data?.error || data?.response?.error;
+    if (upstreamError) {
+        const message = upstreamError?.message || upstreamError?.error?.message || JSON.stringify(upstreamError);
+        const err = new Error(message || 'Upstream returned an error');
+        err.upstreamStatus = response.status;
+        err.upstreamJson = upstreamError;
+        err.upstreamBody = JSON.stringify(data);
+        throw err;
+    }
+    return data;
 }
 
 /**

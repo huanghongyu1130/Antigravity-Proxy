@@ -2,7 +2,7 @@ import { verifyAdmin } from '../middleware/auth.js';
 import {
     getAllAccounts, getAccountById, createAccount, updateAccountStatus, deleteAccount,
     getAllAccountsForRefresh,
-    getRequestLogs, getRequestStats, getModelUsageStats,
+    getRequestLogs, getRequestLogsTotal, getRequestStats, getModelUsageStats,
     getSetting, setSetting
 } from '../db/index.js';
 import { initializeAccount, refreshAccessToken, fetchProjectId, fetchQuotaInfo, fetchDetailedQuotaInfo } from '../services/tokenManager.js';
@@ -234,15 +234,17 @@ export default async function adminRoutes(fastify) {
     fastify.get('/admin/logs', async (request) => {
         const { limit = 100, offset = 0, model, account_id, status, start_time, end_time } = request.query;
 
-        const logs = getRequestLogs(parseInt(limit), parseInt(offset), {
+        const filters = {
             model,
             accountId: account_id ? parseInt(account_id) : null,
             status,
             startTime: start_time ? parseInt(start_time) : null,
             endTime: end_time ? parseInt(end_time) : null
-        });
+        };
+        const logs = getRequestLogs(parseInt(limit), parseInt(offset), filters);
+        const total = getRequestLogsTotal(filters);
 
-        return { logs };
+        return { logs, total };
     });
 
     // GET /admin/stats

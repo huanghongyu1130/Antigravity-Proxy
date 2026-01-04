@@ -103,9 +103,9 @@ export class Dashboard extends Component {
           <tbody>
             ${modelUsage.map(m => `
               <tr>
-                <td class="mono">${this._escape(m.model)}</td>
-                <td>${formatNumber(m.count)}</td>
-                <td>${formatNumber(m.tokens)}</td>
+                <td class="mono" data-label="模型">${this._escape(m.model)}</td>
+                <td data-label="调用次数">${formatNumber(m.count)}</td>
+                <td data-label="Token 数">${formatNumber(m.tokens)}</td>
               </tr>
             `).join('')}
           </tbody>

@@ -61,7 +61,10 @@ for (const p of staticPathCandidates) {
 if (staticRoot) {
     await fastify.register(fastifyStatic, {
         root: staticRoot,
-        prefix: '/'
+        prefix: '/',
+        setHeaders: (res) => {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        }
     });
 
     // SPA history fallback：浏览器直接刷新 /accounts 等路由时返回 index.html

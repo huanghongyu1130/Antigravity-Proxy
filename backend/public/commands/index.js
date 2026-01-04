@@ -140,8 +140,11 @@ commands.register('accounts:refresh-all', async () => {
   
   try {
     const result = await api.refreshAllAccounts();
-    const count = result?.refreshed || 0;
-    loading.update(`已刷新 ${count} 个账号`, 'success');
+    const results = result?.results || [];
+    const count = results.filter(r => r && r.success).length;
+    const total = results.length;
+    const message = total ? `已刷新 ${count}/${total} 个账号` : '没有可刷新的账号';
+    loading.update(message, 'success');
     setTimeout(() => loading.close(), 2000);
     
     await commands.dispatch('accounts:load');

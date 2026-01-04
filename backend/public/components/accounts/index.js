@@ -117,14 +117,14 @@ export class AccountsPage extends Component {
 
     return `
       <tr data-account-id="${a.id}">
-        <td class="mono">${this._escape(a.id)}</td>
-        <td>${this._escape(a.email)}</td>
-        <td><span class="badge ${badgeClass}">${statusText}</span></td>
-        <td class="mono">${this._escape(a.tier || '-')}</td>
-        <td class="mono">${quota}</td>
-        <td class="mono ${a.error_count > 0 ? 'text-danger' : ''}">${a.error_count || 0}</td>
-        <td class="mono" style="font-size:11px">${formatTime(a.last_used_at)}</td>
-        <td>
+        <td class="mono" data-label="ID">${this._escape(a.id)}</td>
+        <td data-label="Email">${this._escape(a.email)}</td>
+        <td data-label="状态"><span class="badge ${badgeClass}">${statusText}</span></td>
+        <td class="mono" data-label="层级">${this._escape(a.tier || '-')}</td>
+        <td class="mono" data-label="配额">${quota}</td>
+        <td class="mono ${a.error_count > 0 ? 'text-danger' : ''}" data-label="错误">${a.error_count || 0}</td>
+        <td class="mono" data-label="最后使用" style="font-size:11px">${formatTime(a.last_used_at)}</td>
+        <td data-label="操作">
           <div class="actions">
             <button class="btn btn-sm btn-icon" 
                     data-cmd="accounts:refresh" 

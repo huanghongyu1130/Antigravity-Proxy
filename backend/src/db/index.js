@@ -177,6 +177,39 @@ export function getRequestLogs(limit = 100, offset = 0, filters = {}) {
     return getDatabase().prepare(sql).all(...params);
 }
 
+export function getRequestLogsTotal(filters = {}) {
+    let sql = `
+        SELECT COUNT(*) as total
+        FROM request_logs l
+        WHERE 1=1
+    `;
+    const params = [];
+
+    if (filters.model) {
+        sql += ' AND l.model = ?';
+        params.push(filters.model);
+    }
+    if (filters.accountId) {
+        sql += ' AND l.account_id = ?';
+        params.push(filters.accountId);
+    }
+    if (filters.status) {
+        sql += ' AND l.status = ?';
+        params.push(filters.status);
+    }
+    if (filters.startTime) {
+        sql += ' AND l.created_at >= ?';
+        params.push(filters.startTime);
+    }
+    if (filters.endTime) {
+        sql += ' AND l.created_at <= ?';
+        params.push(filters.endTime);
+    }
+
+    const row = getDatabase().prepare(sql).get(...params);
+    return row?.total || 0;
+}
+
 export function getRequestStats(startTime, endTime) {
     return getDatabase().prepare(`
         SELECT
