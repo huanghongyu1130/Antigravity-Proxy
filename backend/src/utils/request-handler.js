@@ -1,5 +1,6 @@
 import { isCapacityError, parseResetAfterMs, sleep } from './route-helpers.js';
-import { withCapacityRetry } from './retry-handler.js';
+import { withCapacityRetry, withFullRetry } from './retry-handler.js';
+import { RETRY_CONFIG } from '../config.js';
 
 export function createAbortController(request) {
     const abortController = new AbortController();
@@ -54,6 +55,46 @@ export async function runChatWithCapacityRetry({
     return { account: out.account, result: out.result };
 }
 
+/**
+ * 带完整重试策略的非流式请求：同号重试 + 换号重试
+ */
+export async function runChatWithFullRetry({
+    model,
+    accountPool,
+    buildRequest,
+    execute
+}) {
+    const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
+        ? accountPool.getAvailableAccountCount()
+        : 0;
+    // 换号次数：配置值或账号池大小-1，取较大者
+    const maxAccountSwitches = Math.max(RETRY_CONFIG.maxRetries, Math.max(0, availableCount - 1));
+
+    const out = await withFullRetry({
+        sameAccountRetries: RETRY_CONFIG.sameAccountRetries,
+        sameAccountRetryDelayMs: RETRY_CONFIG.sameAccountRetryDelayMs,
+        maxAccountSwitches,
+        accountSwitchDelayMs: RETRY_CONFIG.baseRetryDelayMs,
+        getAccount: async () => accountPool.getNextAccount(model),
+        executeRequest: async ({ account }) => {
+            const antigravityRequest = buildRequest(account);
+            return await execute(account, antigravityRequest);
+        },
+        onError: async ({ account, error, capacity }) => {
+            if (capacity) {
+                accountPool.markCapacityLimited(account.id, model, error.message || '');
+            }
+            accountPool.unlockAccount(account.id);
+        },
+        onSuccess: async ({ account }) => {
+            accountPool.markCapacityRecovered(account.id, model);
+            accountPool.markAccountSuccess(account.id);
+        }
+    });
+
+    return { account: out.account, result: out.result };
+}
+
 export async function runStreamChatWithCapacityRetry({
     model,
     maxRetries,
@@ -105,5 +146,75 @@ export async function runStreamChatWithCapacityRetry({
             attachAccountToError(error, account);
             throw error;
         }
+    }
+}
+
+/**
+ * 带完整重试策略的流式请求：同号重试 + 换号重试
+ */
+export async function runStreamChatWithFullRetry({
+    model,
+    accountPool,
+    buildRequest,
+    streamChat,
+    onData,
+    abortSignal,
+    canRetry
+}) {
+    const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
+        ? accountPool.getAvailableAccountCount()
+        : 0;
+    const maxAccountSwitches = Math.max(RETRY_CONFIG.maxRetries, Math.max(0, availableCount - 1));
+
+    let lastAccount = null;
+    let aborted = false;
+
+    try {
+        const out = await withFullRetry({
+            sameAccountRetries: RETRY_CONFIG.sameAccountRetries,
+            sameAccountRetryDelayMs: RETRY_CONFIG.sameAccountRetryDelayMs,
+            maxAccountSwitches,
+            accountSwitchDelayMs: RETRY_CONFIG.baseRetryDelayMs,
+            getAccount: async () => accountPool.getNextAccount(model),
+            executeRequest: async ({ account }) => {
+                lastAccount = account;
+                const antigravityRequest = buildRequest(account);
+                await streamChat(account, antigravityRequest, onData, null, abortSignal);
+                return true;
+            },
+            onError: async ({ account, error, capacity }) => {
+                if (abortSignal?.aborted) {
+                    aborted = true;
+                    return;
+                }
+                if (capacity) {
+                    accountPool.markCapacityLimited(account.id, model, error.message || '');
+                }
+                accountPool.unlockAccount(account.id);
+            },
+            onSuccess: async ({ account }) => {
+                accountPool.markCapacityRecovered(account.id, model);
+                accountPool.markAccountSuccess(account.id);
+            },
+            shouldRetryOnSameAccount: ({ error, capacity }) => {
+                // 如果中止了，不重试
+                if (abortSignal?.aborted) return false;
+                // 所有错误都可以同号重试（包括429，会等待冷却时间）
+                return true;
+            },
+            shouldSwitchAccount: ({ error, capacity }) => {
+                if (abortSignal?.aborted) return false;
+                if (typeof canRetry === 'function' && !canRetry({ error })) return false;
+                return true;
+            }
+        });
+
+        return { account: out.account, aborted: false };
+    } catch (error) {
+        if (abortSignal?.aborted || aborted) {
+            return { account: lastAccount, aborted: true };
+        }
+        attachAccountToError(error, lastAccount);
+        throw error;
     }
 }

@@ -8,7 +8,7 @@ import { createRequestLog } from '../db/index.js';
 import { getMappedModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
 import { isCapacityError, SSE_HEADERS } from '../utils/route-helpers.js';
-import { createAbortController, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
+import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
 
 function generateSessionId() {
     return String(-Math.floor(Math.random() * 9e18));
@@ -191,9 +191,6 @@ export default async function geminiRoutes(fastify) {
             let streamChunksForLog = null;
             let errorResponseForLog = null;
 
-            const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
-            const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
-
             try {
                 modelSlotAcquired = acquireModelSlot(model);
                 if (!modelSlotAcquired) {
@@ -274,10 +271,8 @@ export default async function geminiRoutes(fastify) {
                     let sawAnyData = false;
 
                     try {
-                        const out = await runStreamChatWithCapacityRetry({
+                        const out = await runStreamChatWithFullRetry({
                             model,
-                            maxRetries,
-                            baseRetryDelayMs,
                             accountPool,
                             buildRequest: (a) => {
                                 const req = structuredClone(antigravityRequestBase);
@@ -354,10 +349,8 @@ export default async function geminiRoutes(fastify) {
                 }
 
                 // 非流式
-                const out = await runChatWithCapacityRetry({
+                const out = await runChatWithFullRetry({
                     model,
-                    maxRetries,
-                    baseRetryDelayMs,
                     accountPool,
                     buildRequest: (a) => {
                         const req = structuredClone(antigravityRequestBase);
@@ -395,6 +388,7 @@ export default async function geminiRoutes(fastify) {
                 if (account && capacity) {
                     accountPool.markCapacityLimited(account.id, model, msg);
                 } else if (account) {
+                    // 非容量错误：累计错误计数，达到阈值才禁用
                     accountPool.markAccountError(account.id, error);
                 }
 

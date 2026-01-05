@@ -13,7 +13,7 @@ import { createRequestLog } from '../db/index.js';
 import { isThinkingModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
 import { isCapacityError, SSE_HEADERS } from '../utils/route-helpers.js';
-import { createAbortController, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
+import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry } from '../utils/request-handler.js';
 
 export default async function openaiRoutes(fastify) {
     // POST /v1/chat/completions
@@ -41,9 +41,6 @@ export default async function openaiRoutes(fastify) {
         let responseForLog = null;
         let streamChunksForLog = null;
         let errorResponseForLog = null;
-
-        const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
-        const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
 
         try {
             // 1. 获取模型并发槽位（避免本地直接打爆上游）
@@ -76,10 +73,8 @@ export default async function openaiRoutes(fastify) {
                 let lastUsage = null;
 
                 try {
-                    const out = await runStreamChatWithCapacityRetry({
+                    const out = await runStreamChatWithFullRetry({
                         model,
-                        maxRetries,
-                        baseRetryDelayMs,
                         accountPool,
                         buildRequest: (a) => {
                             const req = structuredClone(antigravityRequestBase);
@@ -177,10 +172,8 @@ export default async function openaiRoutes(fastify) {
                 responseForLog = { stream: true, chunks: streamChunksForLog, done: true };
             } else {
                 // 非流式请求（thinking 模型返回思维链）
-                const out = await runChatWithCapacityRetry({
+                const out = await runChatWithFullRetry({
                     model,
-                    maxRetries,
-                    baseRetryDelayMs,
                     accountPool,
                     buildRequest: (a) => {
                         const req = structuredClone(antigravityRequestBase);
@@ -217,7 +210,7 @@ export default async function openaiRoutes(fastify) {
             if (account && capacity) {
                 accountPool.markCapacityLimited(account.id, model, error.message || '');
             } else if (account) {
-                // 其他错误依然标记账号错误，避免持续使用异常账号
+                // 非容量错误：累计错误计数，达到阈值才禁用
                 accountPool.markAccountError(account.id, error);
             }
 

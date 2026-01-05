@@ -1,5 +1,101 @@
 import { isCapacityError, parseResetAfterMs, sleep } from './route-helpers.js';
 
+/**
+ * 完整重试策略：同号重试 + 换号重试
+ *
+ * 策略：
+ * 1. 非容量错误：先在当前账号重试 sameAccountRetries 次
+ * 2. 容量错误：等待冷却时间后重试（同号或换号）
+ * 3. 如果同号重试用尽，换下一个账号继续
+ */
+export async function withFullRetry({
+    sameAccountRetries = 2,       // 同号重试次数
+    sameAccountRetryDelayMs = 500,
+    maxAccountSwitches = 2,       // 最大换号次数
+    accountSwitchDelayMs = 1000,
+    getAccount,
+    executeRequest,
+    onError,                      // 每次错误时调用
+    onSuccess,                    // 成功时调用
+    shouldRetryOnSameAccount,     // 可选：判断是否应该同号重试
+    shouldSwitchAccount           // 可选：判断是否应该换号
+}) {
+    let accountAttempt = 0;
+    const maxSwitches = Math.max(0, Number(maxAccountSwitches || 0));
+    const sameRetryMax = Math.max(0, Number(sameAccountRetries || 0));
+    const sameDelay = Math.max(0, Number(sameAccountRetryDelayMs || 0));
+    const switchDelay = Math.max(0, Number(accountSwitchDelayMs || 0));
+
+    while (accountAttempt <= maxSwitches) {
+        accountAttempt++;
+        let account;
+        try {
+            account = getAccount ? await getAccount({ attempt: accountAttempt }) : null;
+        } catch (err) {
+            // 无法获取账号，直接抛出
+            throw err;
+        }
+
+        // 同号重试循环
+        for (let sameRetry = 0; sameRetry <= sameRetryMax; sameRetry++) {
+            try {
+                const result = await executeRequest({ account, sameRetry, accountAttempt });
+                // 成功
+                if (onSuccess && account) {
+                    await onSuccess({ account, sameRetry, accountAttempt });
+                }
+                return { result, account, sameRetry, accountAttempt };
+            } catch (error) {
+                const capacity = isCapacityError(error);
+
+                // 通知错误
+                if (onError) {
+                    await onError({ account, error, sameRetry, accountAttempt, capacity });
+                }
+
+                // 判断是否继续同号重试
+                const canRetrySame = sameRetry < sameRetryMax;
+                let shouldRetrySame;
+                if (shouldRetryOnSameAccount) {
+                    shouldRetrySame = shouldRetryOnSameAccount({ error, sameRetry, capacity });
+                } else {
+                    // 默认：所有错误都可以同号重试（包括429）
+                    shouldRetrySame = true;
+                }
+
+                if (canRetrySame && shouldRetrySame) {
+                    // 容量错误使用上游返回的冷却时间，其他错误用固定延迟
+                    const delay = capacity
+                        ? (parseResetAfterMs(error?.message) ?? sameDelay * (sameRetry + 1))
+                        : sameDelay * (sameRetry + 1);
+                    await sleep(delay);
+                    continue;
+                }
+
+                // 判断是否换号重试
+                const canSwitch = accountAttempt < maxSwitches + 1;
+                const shouldSwitch = shouldSwitchAccount
+                    ? shouldSwitchAccount({ error, accountAttempt, capacity })
+                    : true;
+
+                if (canSwitch && shouldSwitch) {
+                    // 容量错误使用上游返回的延迟，其他错误使用固定延迟
+                    const delay = capacity
+                        ? (parseResetAfterMs(error?.message) ?? switchDelay)
+                        : switchDelay;
+                    await sleep(delay);
+                    break; // 跳出同号重试循环，进入下一个账号
+                }
+
+                // 不能再重试了，抛出错误
+                throw error;
+            }
+        }
+    }
+
+    throw new Error('All retry attempts exhausted');
+}
+
 export async function withCapacityRetry({
     maxRetries = 0,
     baseRetryDelayMs = 0,

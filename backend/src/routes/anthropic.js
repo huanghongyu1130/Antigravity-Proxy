@@ -12,7 +12,7 @@ import { createRequestLog } from '../db/index.js';
 import { isThinkingModel, AVAILABLE_MODELS } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
 import { isCapacityError, SSE_HEADERS_ANTHROPIC } from '../utils/route-helpers.js';
-import { createAbortController, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
+import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry } from '../utils/request-handler.js';
 
 export default async function anthropicRoutes(fastify) {
     // POST /v1/messages - Anthropic 格式的聊天端点
@@ -47,9 +47,6 @@ export default async function anthropicRoutes(fastify) {
         let responseForLog = null;
         let streamEventsForLog = null;
         let errorResponseForLog = null;
-
-        const maxRetries = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
-        const baseRetryDelayMs = Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
 
         try {
             // 1. 预处理请求 - 尝试补齐/回放 thinking.signature（仅在无法恢复时才会降级禁用 thinking）
@@ -94,10 +91,8 @@ export default async function anthropicRoutes(fastify) {
                 let sawAnyContentBlock = false;
 
                 try {
-                    const out = await runStreamChatWithCapacityRetry({
+                    const out = await runStreamChatWithFullRetry({
                         model,
-                        maxRetries,
-                        baseRetryDelayMs,
                         accountPool,
                         buildRequest: (a) => {
                             const req = structuredClone(antigravityRequestBase);
@@ -199,10 +194,8 @@ export default async function anthropicRoutes(fastify) {
                 responseForLog = { stream: true, events: streamEventsForLog };
             } else {
                 // 非流式请求
-                const out = await runChatWithCapacityRetry({
+                const out = await runChatWithFullRetry({
                     model,
-                    maxRetries,
-                    baseRetryDelayMs,
                     accountPool,
                     buildRequest: (a) => {
                         const req = structuredClone(antigravityRequestBase);
@@ -246,6 +239,7 @@ export default async function anthropicRoutes(fastify) {
             if (account && isCapacityError(error)) {
                 accountPool.markCapacityLimited(account.id, model, error.message || '');
             } else if (account) {
+                // 非容量错误：累计错误计数，达到阈值才禁用
                 accountPool.markAccountError(account.id, error);
             }
 

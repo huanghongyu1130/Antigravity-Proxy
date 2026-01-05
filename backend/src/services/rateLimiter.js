@@ -10,7 +10,8 @@ function parseBoolean(value, defaultValue = false) {
 }
 
 const DISABLE_LOCAL_LIMITS = parseBoolean(process.env.DISABLE_LOCAL_LIMITS, false);
-const MAX_CONCURRENT_PER_MODEL = Number(process.env.MAX_CONCURRENT_PER_MODEL || 3);
+// 每个模型最大并发数（默认 0 = 不限制）
+const MAX_CONCURRENT_PER_MODEL = Number(process.env.MAX_CONCURRENT_PER_MODEL || 0);
 
 // key: model id, value: 当前并发数
 const inFlightPerModel = new Map();

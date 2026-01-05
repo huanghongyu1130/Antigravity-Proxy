@@ -1,5 +1,6 @@
 import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota } from '../db/index.js';
 import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
+import { RETRY_CONFIG } from '../config.js';
 
 function parseBoolean(value, defaultValue = false) {
     if (value === undefined || value === null || value === '') return defaultValue;
@@ -11,8 +12,8 @@ function parseBoolean(value, defaultValue = false) {
 
 const DISABLE_LOCAL_LIMITS = parseBoolean(process.env.DISABLE_LOCAL_LIMITS, false);
 
-// 每个账号允许的最大并发请求数（防止单号被打爆）
-const MAX_CONCURRENT_PER_ACCOUNT = Number(process.env.MAX_CONCURRENT_PER_ACCOUNT || 1);
+// 每个账号允许的最大并发请求数（默认 0 = 不限制）
+const MAX_CONCURRENT_PER_ACCOUNT = Number(process.env.MAX_CONCURRENT_PER_ACCOUNT || 0);
 // 容量耗尽后的默认冷却时间（毫秒），如果上游返回了具体秒数，会在此基础上调整
 const CAPACITY_COOLDOWN_DEFAULT_MS = Number(process.env.CAPACITY_COOLDOWN_DEFAULT_MS || 15000);
 const CAPACITY_COOLDOWN_MAX_MS = Number(process.env.CAPACITY_COOLDOWN_MAX_MS || 120000);
@@ -27,6 +28,7 @@ class AccountPool {
         this.accountLocks = new Map(); // 账号锁，防止并发问题（值为当前并发计数）
         this.capacityCooldowns = new Map(); // 账号在某个模型上的冷却期 key: `${accountId}:${model}` -> timestamp
         this.capacityErrorCounts = new Map(); // 连续容量错误计数 key: `${accountId}:${model}` -> count
+        this.errorCounts = new Map(); // 账号错误计数（非容量错误）key: accountId -> count
     }
 
     /**
@@ -142,10 +144,38 @@ class AccountPool {
     }
 
     /**
-     * 标记账号出错
+     * 标记账号出错 - 累计错误，达到阈值才禁用
+     * @returns {boolean} 是否已禁用账号
      */
     markAccountError(accountId, error) {
-        updateAccountStatus(accountId, 'error', error.message || String(error));
+        const threshold = RETRY_CONFIG.errorCountToDisable;
+        const current = this.errorCounts.get(accountId) || 0;
+        const next = current + 1;
+
+        if (next >= threshold) {
+            // 达到阈值，真正禁用
+            updateAccountStatus(accountId, 'error', error.message || String(error));
+            this.errorCounts.delete(accountId);
+            return true;
+        } else {
+            // 未达阈值，只记录计数
+            this.errorCounts.set(accountId, next);
+            return false;
+        }
+    }
+
+    /**
+     * 请求成功后重置错误计数
+     */
+    markAccountSuccess(accountId) {
+        this.errorCounts.delete(accountId);
+    }
+
+    /**
+     * 获取账号当前错误计数
+     */
+    getErrorCount(accountId) {
+        return this.errorCounts.get(accountId) || 0;
     }
 
     /**

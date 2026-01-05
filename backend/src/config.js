@@ -114,6 +114,18 @@ export const RETRY_CONFIG = Object.freeze({
     },
     get baseRetryDelayMs() {
         return Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
+    },
+    // 同号重试次数（在换号前先重试几次）
+    get sameAccountRetries() {
+        return Math.max(0, Number(process.env.SAME_ACCOUNT_RETRIES || 2));
+    },
+    // 同号重试延迟 (ms)
+    get sameAccountRetryDelayMs() {
+        return Math.max(0, Number(process.env.SAME_ACCOUNT_RETRY_DELAY_MS || 500));
+    },
+    // 连续失败多少次才禁用账号
+    get errorCountToDisable() {
+        return Math.max(1, Number(process.env.ERROR_COUNT_TO_DISABLE || 3));
     }
 });
 
