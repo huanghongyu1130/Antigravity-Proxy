@@ -251,7 +251,15 @@ export default async function geminiRoutes(fastify) {
                     requestId,
                     request: {
                         ...innerRequest,
-                        sessionId: innerRequest.sessionId || generateSessionId()
+                        sessionId: innerRequest.sessionId || generateSessionId(),
+                        // 禁用 Gemini 安全过滤，避免 "no candidates" 错误
+                        safetySettings: innerRequest.safetySettings || [
+                            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
+                            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+                            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
+                            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
+                            { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'OFF' }
+                        ]
                     },
                     model,
                     userAgent: 'antigravity',
