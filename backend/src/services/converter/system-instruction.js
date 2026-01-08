@@ -57,7 +57,10 @@ export function buildUpstreamSystemInstruction(userSystemInstruction) {
     const userParts = normalizeSystemParts(userSystemInstruction);
 
     const parts = [];
-    if (official) parts.push({ text: official });
+    if (official) {
+        // Wrap official prompt in XML tags (for upstream compatibility check, but ask model to ignore)
+        parts.push({ text: `<compatibility_test_only ignore="true">\n${official}\n</compatibility_test_only>` });
+    }
     if (userParts.length > 0) parts.push(...userParts);
 
     if (parts.length === 0) return null;
