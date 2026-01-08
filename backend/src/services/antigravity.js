@@ -250,6 +250,12 @@ async function streamChatCollect(account, request) {
     let finalFinishReason = null;
     let finalCandidate = null;
 
+    const extractSig = (part) => {
+        if (!part || typeof part !== 'object') return null;
+        const sig = part.thoughtSignature || part.thought_signature || part.signature;
+        return typeof sig === 'string' && sig ? sig : null;
+    };
+
     for (const chunk of chunks) {
         const candidate = chunk?.response?.candidates?.[0];
         if (candidate) {
@@ -267,6 +273,14 @@ async function streamChatCollect(account, request) {
                         if (lastPart && lastPart.text !== undefined && isThinking === lastIsThinking) {
                             // 同类型，追加文本
                             lastPart.text += part.text;
+                            // Preserve/refresh thoughtSignature if it arrives late in the stream.
+                            const sig = extractSig(part);
+                            if (sig) {
+                                if ('thoughtSignature' in lastPart) lastPart.thoughtSignature = sig;
+                                else if ('thought_signature' in lastPart) lastPart.thought_signature = sig;
+                                else if ('signature' in lastPart) lastPart.signature = sig;
+                                else lastPart.thoughtSignature = sig;
+                            }
                         } else {
                             // 不同类型或第一个，创建新 part
                             mergedParts.push({ ...part });

@@ -205,7 +205,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
 
     // 添加系统指令：始终注入官方系统提示词（上游可能会校验）
     const shouldAddInterleavedHint = isClaudeModel && thinkingEnabled && Array.isArray(tools) && tools.length > 0;
-    const interleavedHint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
+    const interleavedHint = 'Interleaved thinking is enabled. When tools are present, always emit a brief (non-empty) thinking block before any tool call and again after each tool result, before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
     let systemContent = typeof system === 'string'
         ? system
         : Array.isArray(system)
@@ -725,6 +725,14 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
             return { events: [], state };
         }
 
+        // finishReason is needed early for buffering decisions
+        const finishReasonRaw = candidate.finishReason ?? candidate.finish_reason ?? null;
+        const finishReason = typeof finishReasonRaw === 'string' ? finishReasonRaw.toUpperCase() : '';
+        const isFinalFinish =
+            !!finishReason &&
+            finishReason !== 'FINISH_REASON_UNSPECIFIED' &&
+            finishReason !== 'UNSPECIFIED';
+
 	        const events = [];
 	        let newState = { ...state };
             if (!('messageStarted' in newState)) newState.messageStarted = false;
@@ -739,11 +747,25 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 	        if (!Array.isArray(newState.pendingToolUseIds)) newState.pendingToolUseIds = [];
             if (!('thinkingStopped' in newState)) newState.thinkingStopped = false;
             if (!('completed' in newState)) newState.completed = false;
+            if (!('seenThinkingParts' in newState)) newState.seenThinkingParts = false;
+            // Defer non-thinking content if upstream sends tool_use/text before thought parts.
+            // This avoids emitting an empty thinking block and then permanently skipping late-arriving thinking_delta.
+            if (!Array.isArray(newState.deferredOtherParts)) newState.deferredOtherParts = [];
+            if (!('deferredOtherPartsAt' in newState)) newState.deferredOtherPartsAt = 0;
+            if (!('deferredOtherPartsChunks' in newState)) newState.deferredOtherPartsChunks = 0;
+            if (!('deferredSawThinking' in newState)) newState.deferredSawThinking = false;
 
             const thinkingEnabledForResponse =
                 newState.thinkingEnabled === null || newState.thinkingEnabled === undefined
                     ? isThinkingModel(model)
                     : !!newState.thinkingEnabled;
+
+            const emptyThinkingModeRaw = String(process.env.ANTHROPIC_SSE_EMPTY_THINKING_MODE || 'emit')
+                .trim()
+                .toLowerCase();
+            const emptyThinkingMode = ['emit', 'suppress', 'redacted'].includes(emptyThinkingModeRaw)
+                ? emptyThinkingModeRaw
+                : 'emit';
 
             // Track latest usage so we can emit stable token counts even if usageMetadata appears late in the stream.
             if (usage && typeof usage === 'object') {
@@ -772,10 +794,13 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 newState.messageStarted = true;
             }
 
-	        // 先分离 thinking 和非 thinking 的 parts
-	        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
-	        const thinkingParts = parts.filter(p => p.thought);
-	        const otherParts = parts.filter(p => !p.thought);
+            // 先分离 thinking 和非 thinking 的 parts
+            const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+            const thinkingParts = parts.filter(p => p.thought);
+            const otherParts = parts.filter(p => !p.thought);
+            const significantOtherParts = otherParts.filter((p) =>
+                (p && p.text !== undefined && p.text !== '') || !!p?.functionCall || !!p?.inlineData
+            );
 
             // 兜底：有些上游会把签名放在 candidate 级别或 functionCall 内部
             const preSig =
@@ -794,22 +819,47 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 }
             }
 
-            const ensureLeadingThinkingBlock = () => {
-                if (!thinkingEnabledForResponse) return;
-                if (newState.hasThinking) return;
+            const now = Date.now();
+            const maxDeferMs = Math.max(0, Number(process.env.ANTHROPIC_SSE_DEFER_NON_THINKING_MS || 300));
+            const maxDeferChunks = Math.max(0, Number(process.env.ANTHROPIC_SSE_DEFER_NON_THINKING_CHUNKS || 2));
+            const canDeferNonThinking =
+                thinkingEnabledForResponse &&
+                !newState.thinkingStopped &&
+                !newState.completed &&
+                !newState.hasThinking &&
+                !newState.inThinking &&
+                !newState.inText &&
+                !newState.hasToolUse;
 
-                const sig = newState.lastThinkingSignature || newState.lastUserThinkingSignature || null;
-                events.push({
-                    type: 'content_block_start',
-                    index: 0,
-                    content_block: { type: 'thinking', thinking: '', ...(sig ? { signature: sig } : {}) }
-                });
+            const startDeferring = () => {
+                if (!canDeferNonThinking) return false;
+                if (thinkingParts.length > 0) return false;
+                if (significantOtherParts.length === 0) return false;
+                if (isFinalFinish) return false;
 
-                newState.hasThinking = true;
-                newState.thinkingIndex = 0;
-                newState.inThinking = true;
-                newState.nextIndex = 1;
+                if (newState.deferredOtherPartsAt === 0) newState.deferredOtherPartsAt = now;
+                newState.deferredOtherPartsChunks += 1;
+                newState.deferredOtherParts.push(...significantOtherParts);
+                return true;
             };
+
+            // If we already have buffered non-thinking parts, keep buffering until we either
+            // see thinking parts, hit a safety timeout, or reach message finish.
+            const isDeferring = Array.isArray(newState.deferredOtherParts) && newState.deferredOtherParts.length > 0;
+            if (!isDeferring) {
+                if (startDeferring()) {
+                    return { events, state: newState };
+                }
+            } else if (significantOtherParts.length > 0) {
+                // Keep buffering additional non-thinking parts (do not emit yet).
+                if (newState.deferredOtherPartsAt === 0) newState.deferredOtherPartsAt = now;
+                newState.deferredOtherPartsChunks += 1;
+                newState.deferredOtherParts.push(...significantOtherParts);
+            }
+            const wasDeferringAtEntry = isDeferring;
+            if (wasDeferringAtEntry && thinkingParts.length > 0) {
+                newState.deferredSawThinking = true;
+            }
 
             const closeThinkingBlockIfNeeded = () => {
                 if (!newState.inThinking) return;
@@ -818,7 +868,45 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 newState.thinkingStopped = true;
             };
 
+            const finalizeThinkingBeforeNonThinking = () => {
+                if (!thinkingEnabledForResponse) return;
+                if (newState.thinkingStopped) return;
+
+                // If we already started thinking (and possibly emitted deltas), just close it.
+                if (newState.inThinking) {
+                    closeThinkingBlockIfNeeded();
+                    return;
+                }
+
+                // No thinking parts were emitted. Decide whether to emit an empty block or suppress it.
+                if (emptyThinkingMode === 'suppress') {
+                    // Prevent late-arriving thought parts from emitting after text/tool blocks (index conflict).
+                    newState.thinkingStopped = true;
+                    return;
+                }
+
+                const sig = newState.lastThinkingSignature || newState.lastUserThinkingSignature || null;
+                const canRedact = emptyThinkingMode === 'redacted' && !!sig;
+                const contentBlock = canRedact
+                    ? { type: 'redacted_thinking', signature: sig }
+                    : { type: 'thinking', thinking: '', ...(sig ? { signature: sig } : {}) };
+
+                events.push({
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: contentBlock
+                });
+                events.push({ type: 'content_block_stop', index: 0 });
+
+                newState.hasThinking = true;
+                newState.thinkingIndex = 0;
+                newState.inThinking = false;
+                newState.thinkingStopped = true;
+                newState.nextIndex = 1;
+            };
+
 	        // 先处理 thinking（确保 thinking 在前，index 0）
+            if (thinkingParts.length > 0) newState.seenThinkingParts = true;
 	        for (const part of thinkingParts) {
 	            const sig = extractThoughtSignatureFromPart(part);
 	            if (sig) {
@@ -872,8 +960,41 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 	            });
 	        }
 
-	        // 处理其他 parts（text 和 functionCall）
-	        for (const part of otherParts) {
+            const flushDeferredNonThinkingIfNeeded = () => {
+                if (!Array.isArray(newState.deferredOtherParts) || newState.deferredOtherParts.length === 0) return false;
+
+                const waitedMs = newState.deferredOtherPartsAt > 0 ? now - newState.deferredOtherPartsAt : 0;
+                const exceeded =
+                    (maxDeferMs > 0 && waitedMs >= maxDeferMs) ||
+                    (maxDeferChunks > 0 && newState.deferredOtherPartsChunks >= maxDeferChunks);
+
+                const sawThinkingWhileDeferring = !!newState.deferredSawThinking;
+
+                // Still waiting for the first thinking chunk: keep buffering unless we hit the safety bounds.
+                if (!isFinalFinish && !sawThinkingWhileDeferring && !exceeded) return false;
+
+                // Thinking has started: keep buffering non-thinking until thinking ends (no thought in this chunk),
+                // or until finish, or until we hit the safety bounds.
+                if (!isFinalFinish && sawThinkingWhileDeferring && !exceeded) {
+                    if (thinkingParts.length > 0) return false;
+                }
+
+                // Ensure thinking is finalized (may be empty/redacted/suppressed) before emitting any non-thinking content.
+                finalizeThinkingBeforeNonThinking();
+
+                const buffered = newState.deferredOtherParts.slice();
+                newState.deferredOtherParts = [];
+                newState.deferredOtherPartsAt = 0;
+                newState.deferredOtherPartsChunks = 0;
+                newState.deferredSawThinking = false;
+
+                for (const part of buffered) {
+                    processNonThinkingPart(part);
+                }
+                return true;
+            };
+
+            const processNonThinkingPart = (part) => {
 	            // 兜底：部分上游会把签名放在非 thought part 上（例如 functionCall part）
 	            const sig = extractThoughtSignatureFromPart(part);
 	            if (sig) {
@@ -896,9 +1017,7 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 !!part.functionCall ||
                 !!part.inlineData;
             if (thinkingEnabledForResponse && willEmitNonThinkingContent) {
-                closeThinkingBlockIfNeeded();
-                ensureLeadingThinkingBlock();
-                closeThinkingBlockIfNeeded();
+                finalizeThinkingBeforeNonThinking();
             }
 
             // 处理文本（跳过空文本）
@@ -969,17 +1088,49 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                     index: toolIndex
                 });
             }
-        }
+            };
 
-        // 处理结束：不同上游的 finishReason 取值可能不同（例如 STOP / MAX_TOKENS / SAFETY / OTHER ...）
-        const finishReasonRaw = candidate.finishReason ?? candidate.finish_reason ?? null;
-        const finishReason = typeof finishReasonRaw === 'string' ? finishReasonRaw.toUpperCase() : '';
-        const isFinalFinish =
-            !!finishReason &&
-            finishReason !== 'FINISH_REASON_UNSPECIFIED' &&
-            finishReason !== 'UNSPECIFIED';
+            // If we were deferring earlier non-thinking parts, decide whether to flush now.
+            // - If we are still waiting for thinking, do not emit non-thinking yet.
+            // - Once finish arrives (or timeout hits), flush buffered parts before message_delta/message_stop.
+            flushDeferredNonThinkingIfNeeded();
+            const stillDeferring = Array.isArray(newState.deferredOtherParts) && newState.deferredOtherParts.length > 0;
 
-        if (isFinalFinish) {
+            // 处理其他 parts（text 和 functionCall）
+            if (!stillDeferring) {
+                // If we were deferring at entry, significant non-thinking parts from this chunk were already buffered (and possibly flushed).
+                // Non-significant parts (e.g. empty text placeholders) are ignored anyway.
+                if (!wasDeferringAtEntry) {
+                    for (const part of otherParts) {
+                        processNonThinkingPart(part);
+                    }
+                }
+            } else {
+                // If we are deferring, only emit thinking deltas for this chunk (if any).
+                // Non-thinking parts were already buffered above.
+                if (process.env.DEBUG_THINKING_FLOW && significantOtherParts.length > 0) {
+                    console.warn(JSON.stringify({
+                        kind: 'thinking_defer_non_thinking',
+                        reason: 'waiting_for_thinking_before_emitting_non_thinking',
+                        bufferedCount: newState.deferredOtherParts.length,
+                        bufferedChunks: newState.deferredOtherPartsChunks
+                    }));
+                }
+            }
+
+            if (isFinalFinish) {
+            // If we're still deferring when finish arrives, force flush now.
+            if (Array.isArray(newState.deferredOtherParts) && newState.deferredOtherParts.length > 0) {
+                // Ensure thinking is finalized (may be empty/redacted/suppressed), then emit buffered non-thinking blocks.
+                finalizeThinkingBeforeNonThinking();
+                const buffered = newState.deferredOtherParts.slice();
+                newState.deferredOtherParts = [];
+                newState.deferredOtherPartsAt = 0;
+                newState.deferredOtherPartsChunks = 0;
+                newState.deferredSawThinking = false;
+                for (const part of buffered) processNonThinkingPart(part);
+            }
+
             // 关闭所有打开的块
             if (newState.inThinking) {
                 events.push({
@@ -1228,7 +1379,7 @@ export function preprocessAnthropicRequest(request) {
                     localMutate = true;
                 }
                 // 若客户端丢失 thinking 文本：不要伪造 thinking 内容（可能导致 signature 校验不一致），改用 redacted_thinking
-                if (blocks[0].type === 'thinking' && (blocks[0].thinking === '' || blocks[0].thinking === undefined)) {
+                if (blocks[0].type === 'thinking' && (typeof blocks[0].thinking !== 'string' || blocks[0].thinking.trim() === '')) {
                     blocks[0] = { type: 'redacted_thinking', signature };
                     localMutate = true;
                 }
@@ -1238,7 +1389,7 @@ export function preprocessAnthropicRequest(request) {
                 const patchedThinkingBlock = thinkingBlock?.signature ? thinkingBlock : { ...thinkingBlock, signature };
                 const ensuredThinkingBlock =
                     patchedThinkingBlock?.type === 'thinking' &&
-                    (patchedThinkingBlock.thinking === '' || patchedThinkingBlock.thinking === undefined)
+                    (typeof patchedThinkingBlock.thinking !== 'string' || patchedThinkingBlock.thinking.trim() === '')
                         ? { type: 'redacted_thinking', signature }
                         : patchedThinkingBlock;
                 blocks.unshift(ensuredThinkingBlock);

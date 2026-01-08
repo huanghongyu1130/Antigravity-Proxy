@@ -231,7 +231,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     }
 
     if (isClaudeModel && enableThinking && hasTools) {
-        const interleavedHint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
+        const interleavedHint = 'Interleaved thinking is enabled. When tools are present, always emit a brief (non-empty) thinking block before any tool call and again after each tool result, before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
         if (!systemContent.includes(interleavedHint)) {
             systemContent = systemContent ? `${systemContent}\n\n${interleavedHint}` : interleavedHint;
         }
@@ -366,12 +366,14 @@ function convertMessage(msg, ctx = {}) {
     // assistant tool_calls
     if (msg.role === 'assistant' && msg.tool_calls) {
         const parts = [];
+        let replayClaudeSignature = null;
 
         // OpenAI endpoint: replay Claude tools signature from proxy cache
         if (isClaudeModel && enableThinking) {
             const firstToolCallId = msg.tool_calls?.[0]?.id;
             const replayClaude = firstToolCallId ? getCachedClaudeToolThinking(firstToolCallId) : null;
             if (replayClaude?.signature) {
+                replayClaudeSignature = replayClaude.signature;
                 let replayText = CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replayClaude.thoughtText || '') : '';
                 if (typeof replayText !== 'string') replayText = '';
                 if (replayText === '') replayText = ' ';
@@ -425,7 +427,9 @@ function convertMessage(msg, ctx = {}) {
                 args = injectClaudeToolRequiredArgPlaceholderIntoArgs(args || {});
             }
             if (!thoughtSignature && isClaudeModel && enableThinking) {
-                thoughtSignature = CLAUDE_TOOL_SIGNATURE_SENTINEL;
+                // Claude extended thinking: tool_use blocks are validated against the turn's thinking signature.
+                // Prefer the replayed thinking signature when available; otherwise fall back to sentinel.
+                thoughtSignature = replayClaudeSignature || CLAUDE_TOOL_SIGNATURE_SENTINEL;
             }
             parts.push({
                 ...(thoughtSignature ? { thoughtSignature } : {}),
