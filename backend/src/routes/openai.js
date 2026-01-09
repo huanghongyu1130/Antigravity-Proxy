@@ -22,7 +22,10 @@ export default async function openaiRoutes(fastify) {
     }, async (request, reply) => {
         const startTime = Date.now();
         const openaiRequest = request.body;
-        const { stream = false, model } = openaiRequest;
+        const { stream = false, model, thinking_budget, budget_tokens } = openaiRequest;
+        // Determine if we should include thinking output:
+        // Enable if model is a thinking model OR user explicitly passed thinking_budget/budget_tokens
+        const includeThinking = isThinkingModel(model) || thinking_budget !== undefined || budget_tokens !== undefined;
         const includeUsageInStream = !!(
             stream &&
             openaiRequest &&
@@ -91,7 +94,7 @@ export default async function openaiRoutes(fastify) {
                                 lastUsage = extractedUsage;
                             }
 
-                            const chunks = convertSSEChunk(data, requestId, model, isThinkingModel(model));
+                            const chunks = convertSSEChunk(data, requestId, model, includeThinking);
                             if (chunks) {
                                 for (const chunk of chunks) {
                                     if (chunk?.error?.message) {
@@ -187,7 +190,7 @@ export default async function openaiRoutes(fastify) {
                 });
                 account = out.account;
                 const antigravityResponse = out.result;
-                const openaiResponse = convertResponse(antigravityResponse, requestId, model, isThinkingModel(model));
+                const openaiResponse = convertResponse(antigravityResponse, requestId, model, includeThinking);
 
                 usage = {
                     promptTokens: openaiResponse.usage.prompt_tokens,

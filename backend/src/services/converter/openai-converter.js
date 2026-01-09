@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 
-import { AVAILABLE_MODELS, getMappedModel, isThinkingModel } from '../../config.js';
+import { AVAILABLE_MODELS, getMappedModel, isThinkingModel, isImageGenerationModel } from '../../config.js';
 
 import { injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertTool, generateSessionId, parseDataUrl } from './schema-converter.js';
@@ -94,11 +94,15 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     // Claude: no topP, and extended thinking requires signature replay on tool chain
     const isClaudeModel = model.includes('claude');
 
+    // Check if this is an image generation model (no system prompt, no thinking)
+    const isImageModel = isImageGenerationModel(model);
+
     const looksLikeClaudeToolId = (id) => typeof id === 'string' && id.startsWith('toolu_');
 
     // OpenAI side: Claude tool chain needs signature replay (only for Claude-generated tool_call_id)
     // If history contains Claude tool_calls/tool results but cache missing -> downgrade thinking to avoid upstream error
-    let enableThinking = isThinkingModel(model);
+    // Enable thinking: by model default OR by explicit thinking_budget/budget_tokens parameter
+    let enableThinking = isThinkingModel(model) || thinking_budget !== undefined || budget_tokens !== undefined;
     if (enableThinking && isClaudeModel && (hasToolCallsInHistory || hasToolResultsInHistory)) {
         const ids = new Set();
         for (const msg of nonSystemMessages) {
@@ -309,13 +313,16 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         },
         model: actualModel,
         userAgent: 'antigravity',
-        requestType: 'agent'
+        requestType: isImageModel ? 'image_gen' : 'agent'
     };
 
     // systemInstruction: always prepend official prompt (upstream may validate it)
-    const upstreamSystemInstruction = buildUpstreamSystemInstruction(systemContent);
-    if (upstreamSystemInstruction) {
-        request.request.systemInstruction = upstreamSystemInstruction;
+    // Skip for image generation models (they don't support system instructions)
+    if (!isImageModel) {
+        const upstreamSystemInstruction = buildUpstreamSystemInstruction(systemContent);
+        if (upstreamSystemInstruction) {
+            request.request.systemInstruction = upstreamSystemInstruction;
+        }
     }
 
     // tools
