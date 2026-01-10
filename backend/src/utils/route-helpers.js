@@ -23,19 +23,98 @@ export function isCapacityError(err) {
 }
 
 /**
+ * 判断是否为认证失败错误（账号被禁用/吊销/需要验证）
+ * 这类错误应该触发 token 刷新重试，若仍失败则禁用账号
+ */
+export function isAuthenticationError(err) {
+    const msg = err?.message || '';
+    const msgLower = msg.toLowerCase();
+    const status = err?.upstreamStatus;
+
+    // HTTP 401 Unauthorized - 明确的认证失败
+    if (status === 401) {
+        return true;
+    }
+
+    // HTTP 403 Forbidden - 只有认证相关的 403 才算
+    if (status === 403) {
+        if (
+            msgLower.includes('authentication') ||
+            msgLower.includes('credential') ||
+            msgLower.includes('unauthorized') ||
+            msgLower.includes('access denied') ||
+            msgLower.includes('permission denied') ||
+            msgLower.includes('account') ||
+            msgLower.includes('oauth')
+        ) {
+            return true;
+        }
+    }
+
+    // 关键词匹配 - 认证相关错误
+    if (
+        msgLower.includes('invalid authentication') ||
+        msgLower.includes('invalid credential') ||
+        msgLower.includes('invalid_grant') ||
+        msgLower.includes('unauthorized_client') ||
+        msgLower.includes('authentication failed') ||
+        msgLower.includes('oauth 2 access token') ||
+        msgLower.includes('access token') ||
+        msgLower.includes('token has been expired or revoked') ||
+        msgLower.includes('token revoked') ||
+        msgLower.includes('refresh token') ||
+        msgLower.includes('account disabled') ||
+        msgLower.includes('account suspended') ||
+        msgLower.includes('account banned') ||
+        msgLower.includes('verification required') ||
+        msgLower.includes('login required')
+    ) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * 判断是否为 refresh_token 失效错误（需要立即禁用，无法自动恢复）
+ */
+export function isRefreshTokenInvalidError(err) {
+    const msg = err?.message || '';
+    const msgLower = msg.toLowerCase();
+
+    return (
+        msgLower.includes('invalid_grant') ||
+        msgLower.includes('unauthorized_client') ||
+        msgLower.includes('token has been expired or revoked') ||
+        msgLower.includes('token revoked') ||
+        msgLower.includes('refresh token') ||
+        msgLower.includes('account disabled') ||
+        msgLower.includes('account suspended') ||
+        msgLower.includes('account banned') ||
+        msgLower.includes('verification required')
+    );
+}
+
+/**
  * 判断是否为不可重试的错误（这类错误换号也不会成功，应直接返回给客户端）
  * - 安全拦截 / 内容审核
  * - 请求太长 / token 超限
  * - 请求格式错误
  * - 模型不存在
+ * 注意：认证错误 (401/403) 不在此列，需要单独处理（刷新 token 后重试）
  */
 export function isNonRetryableError(err) {
     const msg = err?.message || '';
     const msgLower = msg.toLowerCase();
     const status = err?.upstreamStatus;
 
-    // 400 系列错误（除 429 外）通常是请求本身的问题，重试无意义
-    if (status && status >= 400 && status < 500 && status !== 429) {
+    // 认证错误需要特殊处理（刷新 token 后重试），不算"不可重试"
+    if (isAuthenticationError(err)) {
+        return false;
+    }
+
+    // 400 系列错误（除 429、401、403 外）通常是请求本身的问题，重试无意义
+    if (status && status >= 400 && status < 500 && status !== 429 && status !== 401 && status !== 403) {
         return true;
     }
 

@@ -7,7 +7,7 @@ import { streamChat, chat, countTokens, fetchAvailableModels } from '../services
 import { createRequestLog } from '../db/index.js';
 import { getMappedModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, parseResetAfterMs, SSE_HEADERS } from '../utils/route-helpers.js';
+import { isCapacityError, isAuthenticationError, parseResetAfterMs, SSE_HEADERS } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
 import { buildUpstreamSystemInstruction } from '../services/converter/system-instruction.js';
 
@@ -410,19 +410,19 @@ export default async function geminiRoutes(fastify) {
 
                 const msg = error.message || '';
                 const capacity = isCapacityError(error);
+                const authError = isAuthenticationError(error);
                 const retryAfterMs = Number.isFinite(error?.retryAfterMs)
                     ? error.retryAfterMs
                     : parseResetAfterMs(error?.message);
 
                 if (account && capacity) {
                     accountPool.markCapacityLimited(account.id, model, msg);
-                } else if (account) {
-                    // 非容量错误：累计错误计数，达到阈值才禁用
+                } else if (account && !authError && !error?.authHandled) {
                     accountPool.markAccountError(account.id, error);
                 }
 
-                const httpStatus = capacity ? 429 : 500;
-                const errorCode = capacity ? 'rate_limit_exceeded' : 'internal_error';
+                const httpStatus = capacity ? 429 : (authError ? 401 : 500);
+                const errorCode = capacity ? 'rate_limit_exceeded' : (authError ? 'invalid_api_key' : 'internal_error');
                 if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {
                     reply.header('Retry-After', Math.max(0, Math.ceil(retryAfterMs / 1000)));
                 }

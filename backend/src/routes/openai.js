@@ -12,7 +12,7 @@ import {
 import { createRequestLog } from '../db/index.js';
 import { isThinkingModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, parseResetAfterMs, SSE_HEADERS } from '../utils/route-helpers.js';
+import { isCapacityError, isAuthenticationError, parseResetAfterMs, SSE_HEADERS } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry } from '../utils/request-handler.js';
 
 export default async function openaiRoutes(fastify) {
@@ -208,20 +208,19 @@ export default async function openaiRoutes(fastify) {
             errorMessage = error.message;
 
             const capacity = isCapacityError(error);
+            const authError = isAuthenticationError(error);
             const retryAfterMs = Number.isFinite(error?.retryAfterMs)
                 ? error.retryAfterMs
                 : parseResetAfterMs(error?.message);
 
-            // 容量耗尽：不把账号标成 error，只做短暂冷却，并返回 429
             if (account && capacity) {
                 accountPool.markCapacityLimited(account.id, model, error.message || '');
-            } else if (account) {
-                // 非容量错误：累计错误计数，达到阈值才禁用
+            } else if (account && !authError && !error?.authHandled) {
                 accountPool.markAccountError(account.id, error);
             }
 
-            const httpStatus = capacity ? 429 : 500;
-            const errorCode = capacity ? 'rate_limit_exceeded' : 'internal_error';
+            const httpStatus = capacity ? 429 : (authError ? 401 : 500);
+            const errorCode = capacity ? 'rate_limit_exceeded' : (authError ? 'invalid_api_key' : 'internal_error');
 
             // 返回 OpenAI 格式的错误
             if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {

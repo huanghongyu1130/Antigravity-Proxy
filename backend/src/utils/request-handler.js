@@ -1,6 +1,8 @@
-import { isCapacityError, isNonRetryableError, parseResetAfterMs, sleep } from './route-helpers.js';
+import { isCapacityError, isNonRetryableError, isAuthenticationError, isRefreshTokenInvalidError, parseResetAfterMs, sleep } from './route-helpers.js';
 import { withCapacityRetry, withFullRetry } from './retry-handler.js';
 import { RETRY_CONFIG } from '../config.js';
+import { forceRefreshToken } from '../services/tokenManager.js';
+import { updateAccountStatus } from '../db/index.js';
 
 export function createAbortController(request) {
     const abortController = new AbortController();
@@ -11,9 +13,33 @@ export function createAbortController(request) {
 function attachAccountToError(error, account) {
     if (!error || typeof error !== 'object') return;
     if (!account) return;
-    // internal-only: used by routes to unlock / markAccountError consistently after refactor
     if (!Object.prototype.hasOwnProperty.call(error, 'account')) {
         Object.defineProperty(error, 'account', { value: account, enumerable: false });
+    }
+}
+
+async function handleAuthErrorWithRefresh(account, error, execute, antigravityRequest) {
+    if (!isAuthenticationError(error)) {
+        return null;
+    }
+
+    if (isRefreshTokenInvalidError(error)) {
+        updateAccountStatus(account.id, 'error', `Auth permanently invalid: ${error.message}`);
+        return null;
+    }
+
+    const refreshResult = await forceRefreshToken(account);
+    if (!refreshResult) {
+        updateAccountStatus(account.id, 'error', `Token refresh failed after auth error: ${error.message}`);
+        return null;
+    }
+
+    try {
+        const result = await execute(account, antigravityRequest);
+        return { success: true, result };
+    } catch (retryError) {
+        updateAccountStatus(account.id, 'error', `Auth error persists after refresh: ${retryError.message}`);
+        return { success: false, error: retryError };
     }
 }
 
@@ -59,7 +85,7 @@ export async function runChatWithCapacityRetry({
 }
 
 /**
- * 带完整重试策略的非流式请求：同号重试 + 换号重试
+ * 带完整重试策略的非流式请求：同号重试 + 换号重试 + 认证错误刷新重试
  */
 export async function runChatWithFullRetry({
     model,
@@ -70,7 +96,6 @@ export async function runChatWithFullRetry({
     const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
         ? accountPool.getAvailableAccountCount(model)
         : 0;
-    // 换号次数：配置值或账号池大小-1，取较大者
     const maxAccountSwitches = Math.max(RETRY_CONFIG.maxRetries, Math.max(0, availableCount - 1));
 
     const out = await withFullRetry({
@@ -82,15 +107,26 @@ export async function runChatWithFullRetry({
         getAccount: async () => accountPool.getNextAccount(model),
         executeRequest: async ({ account }) => {
             const antigravityRequest = buildRequest(account);
-            return await execute(account, antigravityRequest);
+            try {
+                return await execute(account, antigravityRequest);
+            } catch (error) {
+                if (isAuthenticationError(error)) {
+                    const authRetryResult = await handleAuthErrorWithRefresh(account, error, execute, antigravityRequest);
+                    if (authRetryResult?.success) {
+                        return authRetryResult.result;
+                    }
+                    error.authHandled = true;
+                }
+                throw error;
+            }
         },
-        shouldRetryOnSameAccount: ({ capacity }) => {
-            // 容量/配额类错误同号重试意义不大：直接切号更快
+        shouldRetryOnSameAccount: ({ error, capacity }) => {
+            if (error?.authHandled) return false;
             if (capacity) return false;
             return true;
         },
-        shouldSwitchAccount: ({ capacity }) => {
-            // 单账号场景：不要切号重试，直接返回 429（并透传 reset after）
+        shouldSwitchAccount: ({ error, capacity }) => {
+            if (error?.authHandled) return false;
             if (capacity && availableCount <= 1) return false;
             return true;
         },
@@ -170,7 +206,7 @@ export async function runStreamChatWithCapacityRetry({
 }
 
 /**
- * 带完整重试策略的流式请求：同号重试 + 换号重试
+ * 带完整重试策略的流式请求：同号重试 + 换号重试 + 认证错误刷新重试
  */
 export async function runStreamChatWithFullRetry({
     model,
@@ -200,10 +236,29 @@ export async function runStreamChatWithFullRetry({
             executeRequest: async ({ account }) => {
                 lastAccount = account;
                 const antigravityRequest = buildRequest(account);
-                await streamChat(account, antigravityRequest, onData, null, abortSignal);
-                return true;
+                try {
+                    await streamChat(account, antigravityRequest, onData, null, abortSignal);
+                    return true;
+                } catch (error) {
+                    if (isAuthenticationError(error)) {
+                        const authRetryResult = await handleAuthErrorWithRefresh(
+                            account,
+                            error,
+                            async (acc, req) => {
+                                await streamChat(acc, req, onData, null, abortSignal);
+                                return true;
+                            },
+                            antigravityRequest
+                        );
+                        if (authRetryResult?.success) {
+                            return authRetryResult.result;
+                        }
+                        error.authHandled = true;
+                    }
+                    throw error;
+                }
             },
-            onError: async ({ account, error, capacity, nonRetryable }) => {
+            onError: async ({ account, error, capacity }) => {
                 if (abortSignal?.aborted) {
                     aborted = true;
                     return;
@@ -221,19 +276,16 @@ export async function runStreamChatWithFullRetry({
                 accountPool.markAccountSuccess(account.id);
             },
             shouldRetryOnSameAccount: ({ error, capacity }) => {
-                // 如果中止了，不重试
                 if (abortSignal?.aborted) return false;
-                // 不可重试错误不再同号重试（会在 withFullRetry 中直接抛出）
+                if (error?.authHandled) return false;
                 if (isNonRetryableError(error)) return false;
-                // 容量/配额类错误直接切号，冷却由 accountPool 负责
                 if (capacity) return false;
                 return true;
             },
             shouldSwitchAccount: ({ error, capacity }) => {
                 if (abortSignal?.aborted) return false;
-                // 不可重试错误不换号（会在 withFullRetry 中直接抛出）
+                if (error?.authHandled) return false;
                 if (isNonRetryableError(error)) return false;
-                // 单账号场景：不要切号重试，直接返回 429（并透传 reset after）
                 if (capacity && availableCount <= 1) return false;
                 if (typeof canRetry === 'function' && !canRetry({ error })) return false;
                 return true;

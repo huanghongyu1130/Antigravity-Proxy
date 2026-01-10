@@ -4,6 +4,9 @@ import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAcco
 // Token 刷新提前时间（5分钟）
 const TOKEN_REFRESH_BUFFER = 5 * 60 * 1000;
 
+// Singleflight: 防止同一账号并发刷新 token (key: accountId -> Promise)
+const refreshInFlight = new Map();
+
 // Only consider models that this proxy actually exposes (mapped to upstream names).
 const QUOTA_RELEVANT_MODELS = new Set(AVAILABLE_MODELS.map((m) => getMappedModel(m.id)));
 
@@ -52,6 +55,39 @@ export async function refreshAccessToken(account) {
         updateAccountStatus(account.id, 'error', error.message);
         throw error;
     }
+}
+
+/**
+ * 强制刷新 token（用于 401 认证错误后的恢复尝试）
+ * 使用 singleflight 模式防止并发刷新
+ * @returns {Promise<{access_token, expires_in} | null>} 成功返回新 token，失败返回 null
+ */
+export async function forceRefreshToken(account) {
+    if (!account?.id || !account?.refresh_token) {
+        return null;
+    }
+
+    const accountId = account.id;
+    const existing = refreshInFlight.get(accountId);
+    if (existing) {
+        return existing;
+    }
+
+    const refreshPromise = (async () => {
+        try {
+            const result = await refreshAccessToken(account);
+            account.access_token = result.access_token;
+            account.token_expires_at = Date.now() + (result.expires_in * 1000);
+            return result;
+        } catch (error) {
+            return null;
+        } finally {
+            refreshInFlight.delete(accountId);
+        }
+    })();
+
+    refreshInFlight.set(accountId, refreshPromise);
+    return refreshPromise;
 }
 
 /**
