@@ -12,7 +12,7 @@ import { buildUpstreamSystemInstruction } from './system-instruction.js';
 // Defaults
 const DEFAULT_THINKING_BUDGET = 4096;
 const DEFAULT_TEMPERATURE = 1;
-const CLAUDE_TOOL_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
+const GEMINI_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
 
 // Tool-chain: cap overly large max_tokens when tools/tool_results exist (disabled by default)
 const MAX_OUTPUT_TOKENS_WITH_TOOLS = Number(process.env.MAX_OUTPUT_TOKENS_WITH_TOOLS ?? 0);
@@ -60,6 +60,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         actualModel = 'gemini-2.5-flash';
     }
     const isClaudeModel = model.includes('claude');
+    const isGeminiModel = String(actualModel || '').includes('gemini');
 
     // Claude thinking：当工具 schema 没有 required 字段时，上游偶发不下发 tool_use/tool_call（只输出 thinking 然后结束）
     const claudeToolsNeedingRequiredPlaceholder = new Set();
@@ -119,7 +120,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
             }
         }
 
-        contents.push(convertAnthropicMessage(msg, thinkingEnabled, { isClaudeModel, thinkingEnabled, claudeToolsNeedingRequiredPlaceholder, userKey }));
+        contents.push(convertAnthropicMessage(msg, thinkingEnabled, { isClaudeModel, isGeminiModel, thinkingEnabled, claudeToolsNeedingRequiredPlaceholder, userKey }));
     }
 
     // 构建 generationConfig
@@ -401,7 +402,7 @@ function getBuiltinAnthropicToolSchema(name) {
  * 转换 Anthropic 格式的单条消息
  */
 function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
-    const { isClaudeModel = false, claudeToolsNeedingRequiredPlaceholder = null, userKey = null } = ctx;
+    const { isClaudeModel = false, isGeminiModel = false, claudeToolsNeedingRequiredPlaceholder = null, userKey = null } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // 简单文本消息
@@ -491,9 +492,8 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
                             cacheClaudeThinkingSignature(item.id, thoughtSignature);
                         }
                     }
-                    if (!thoughtSignature) {
-                        thoughtSignature = CLAUDE_TOOL_SIGNATURE_SENTINEL;
-                    }
+                } else if (isGeminiModel && thinkingEnabled) {
+                    thoughtSignature = item?.thoughtSignature || item?.thought_signature || GEMINI_THOUGHT_SIGNATURE_SENTINEL;
                 }
                 functionCallParts.push({
                     ...(thoughtSignature ? { thoughtSignature } : {}),
@@ -1054,14 +1054,7 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 	                const toolIndex = newState.nextIndex || (newState.hasThinking ? 1 : 0);
 	                newState.nextIndex = toolIndex + 1;
 	                const toolUseId = part.functionCall.id || `toolu_${uuidv4().slice(0, 8)}`;
-                    const fallbackSig = newState.lastThinkingSignature || newState.lastUserThinkingSignature || null;
-	                if (fallbackSig) {
-                        // 上游有时不会在该回合再次下发 signature：复用 last-signature 让工具链路不断档
-	                    cacheClaudeThinkingSignature(toolUseId, fallbackSig);
-                        if (!newState.lastThinkingSignature) newState.lastThinkingSignature = fallbackSig;
-	                } else {
-	                    newState.pendingToolUseIds.push(toolUseId);
-	                }
+                    newState.pendingToolUseIds.push(toolUseId);
 
 	                events.push({
 	                    type: 'content_block_start',

@@ -12,7 +12,7 @@ import { buildUpstreamSystemInstruction } from './system-instruction.js';
 // Defaults
 const DEFAULT_THINKING_BUDGET = 4096;
 const DEFAULT_TEMPERATURE = 1;
-const CLAUDE_TOOL_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
+const GEMINI_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
 
 // Tool-chain: cap max_tokens when request contains tools/tool_results (disabled by default)
 const MAX_OUTPUT_TOKENS_WITH_TOOLS = Number(process.env.MAX_OUTPUT_TOKENS_WITH_TOOLS ?? 0);
@@ -93,6 +93,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 
     // Claude: no topP, and extended thinking requires signature replay on tool chain
     const isClaudeModel = model.includes('claude');
+    const isGeminiModel = model.includes('gemini') || String(actualModel || '').includes('gemini');
 
     // Check if this is an image generation model (no system prompt, no thinking)
     const isImageModel = isImageGenerationModel(model);
@@ -230,7 +231,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                 }
                 continue;
             }
-            contents.push(convertMessage(msg, { isClaudeModel, enableThinking, claudeToolsNeedingRequiredPlaceholder }));
+            contents.push(convertMessage(msg, { isClaudeModel, isGeminiModel, enableThinking, claudeToolsNeedingRequiredPlaceholder }));
         }
     }
 
@@ -349,6 +350,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 function convertMessage(msg, ctx = {}) {
     const {
         isClaudeModel = false,
+        isGeminiModel = false,
         enableThinking = false,
         claudeToolsNeedingRequiredPlaceholder = null
     } = ctx;
@@ -434,9 +436,10 @@ function convertMessage(msg, ctx = {}) {
                 args = injectClaudeToolRequiredArgPlaceholderIntoArgs(args || {});
             }
             if (!thoughtSignature && isClaudeModel && enableThinking) {
-                // Claude extended thinking: tool_use blocks are validated against the turn's thinking signature.
-                // Prefer the replayed thinking signature when available; otherwise fall back to sentinel.
-                thoughtSignature = replayClaudeSignature || CLAUDE_TOOL_SIGNATURE_SENTINEL;
+                thoughtSignature = replayClaudeSignature || null;
+            }
+            if (!thoughtSignature && isGeminiModel && enableThinking) {
+                thoughtSignature = GEMINI_THOUGHT_SIGNATURE_SENTINEL;
             }
             parts.push({
                 ...(thoughtSignature ? { thoughtSignature } : {}),
