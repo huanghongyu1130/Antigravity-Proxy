@@ -17,6 +17,36 @@ const GEMINI_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
 // Tool-chain: cap overly large max_tokens when tools/tool_results exist (disabled by default)
 const MAX_OUTPUT_TOKENS_WITH_TOOLS = Number(process.env.MAX_OUTPUT_TOKENS_WITH_TOOLS ?? 0);
 
+const DEBUG_CLAUDE_THINKING_SIGNATURE = (() => {
+    const raw = process.env.DEBUG_CLAUDE_THINKING_SIGNATURE;
+    if (raw === undefined || raw === null || raw === '') return false;
+    const v = String(raw).trim().toLowerCase();
+    return ['1', 'true', 'yes', 'y', 'on'].includes(v);
+})();
+
+// Whether to persist lastSig -> tool_use_id when we have to fall back (potentially polluting).
+// Default behavior:
+// - enabled, but DO NOT write back for userKey='api_key:static' unless explicitly allowed.
+const CLAUDE_LAST_SIG_WRITEBACK_ENABLED = (() => {
+    const raw = process.env.CLAUDE_LAST_SIG_WRITEBACK;
+    if (raw === undefined || raw === null || raw === '') return true;
+    const v = String(raw).trim().toLowerCase();
+    return ['1', 'true', 'yes', 'y', 'on'].includes(v);
+})();
+const CLAUDE_LAST_SIG_WRITEBACK_ALLOW_STATIC = (() => {
+    const raw = process.env.CLAUDE_LAST_SIG_WRITEBACK_ALLOW_STATIC;
+    if (raw === undefined || raw === null || raw === '') return false;
+    const v = String(raw).trim().toLowerCase();
+    return ['1', 'true', 'yes', 'y', 'on'].includes(v);
+})();
+
+function shouldWritebackClaudeLastSig(userKey) {
+    if (!CLAUDE_LAST_SIG_WRITEBACK_ENABLED) return false;
+    if (!userKey) return false;
+    if (String(userKey) === 'api_key:static' && !CLAUDE_LAST_SIG_WRITEBACK_ALLOW_STATIC) return false;
+    return true;
+}
+
 // ==================== Anthropic 格式转换 ====================
 
 /**
@@ -486,15 +516,27 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
                     } else if (item?.id) {
                         thoughtSignature = getCachedClaudeThinkingSignature(item.id);
                     }
-                    if (!thoughtSignature && userKey) {
-                        thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
-                        if (thoughtSignature && item?.id) {
-                            cacheClaudeThinkingSignature(item.id, thoughtSignature);
-                        }
-                    }
-                } else if (isGeminiModel && thinkingEnabled) {
-                    thoughtSignature = item?.thoughtSignature || item?.thought_signature || GEMINI_THOUGHT_SIGNATURE_SENTINEL;
-                }
+	                    if (!thoughtSignature && userKey) {
+	                        thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
+	                        const willWriteback = !!(thoughtSignature && item?.id && shouldWritebackClaudeLastSig(userKey));
+	                        if (willWriteback) cacheClaudeThinkingSignature(item.id, thoughtSignature);
+	                        if (DEBUG_CLAUDE_THINKING_SIGNATURE && thoughtSignature) {
+	                            try {
+	                                console.warn(JSON.stringify({
+	                                    kind: 'claude_thinking_signature_fallback',
+	                                    phase: 'anthropic_to_antigravity_tool_use',
+	                                    userKey,
+	                                    tool_use_id: item?.id || null,
+	                                    sig_prefix: String(thoughtSignature).slice(0, 24),
+	                                    sig_tail: String(thoughtSignature).slice(-16),
+	                                    writeback: willWriteback
+	                                }));
+	                            } catch { /* ignore */ }
+	                        }
+	                    }
+	                } else if (isGeminiModel && thinkingEnabled) {
+	                    thoughtSignature = item?.thoughtSignature || item?.thought_signature || GEMINI_THOUGHT_SIGNATURE_SENTINEL;
+	                }
                 functionCallParts.push({
                     ...(thoughtSignature ? { thoughtSignature } : {}),
                     functionCall: {
@@ -813,11 +855,25 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                     cacheClaudeLastThinkingSignature(newState.userKey, preSig);
                     newState.lastUserThinkingSignature = preSig;
                 }
-                if (newState.pendingToolUseIds.length > 0) {
-                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, preSig);
-                    newState.pendingToolUseIds = [];
-                }
-            }
+	                if (newState.pendingToolUseIds.length > 0) {
+	                    if (DEBUG_CLAUDE_THINKING_SIGNATURE) {
+	                        try {
+	                            console.warn(JSON.stringify({
+	                                kind: 'claude_thinking_signature_flush',
+	                                phase: 'sse_preSig',
+	                                requestId,
+	                                userKey: newState.userKey || null,
+	                                tool_use_ids: newState.pendingToolUseIds.slice(0, 20),
+	                                tool_use_count: newState.pendingToolUseIds.length,
+	                                sig_prefix: String(preSig).slice(0, 24),
+	                                sig_tail: String(preSig).slice(-16)
+	                            }));
+	                        } catch { /* ignore */ }
+	                    }
+	                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, preSig);
+	                    newState.pendingToolUseIds = [];
+	                }
+	            }
 
             const now = Date.now();
             const maxDeferMs = Math.max(0, Number(process.env.ANTHROPIC_SSE_DEFER_NON_THINKING_MS || 300));
@@ -915,11 +971,25 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                         cacheClaudeLastThinkingSignature(newState.userKey, sig);
                         newState.lastUserThinkingSignature = sig;
                     }
-	                if (newState.pendingToolUseIds.length > 0) {
-	                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, sig);
-	                    newState.pendingToolUseIds = [];
-	                }
-	            }
+		                if (newState.pendingToolUseIds.length > 0) {
+		                    if (DEBUG_CLAUDE_THINKING_SIGNATURE) {
+		                        try {
+		                            console.warn(JSON.stringify({
+		                                kind: 'claude_thinking_signature_flush',
+		                                phase: 'sse_thinking_part',
+		                                requestId,
+		                                userKey: newState.userKey || null,
+		                                tool_use_ids: newState.pendingToolUseIds.slice(0, 20),
+		                                tool_use_count: newState.pendingToolUseIds.length,
+		                                sig_prefix: String(sig).slice(0, 24),
+		                                sig_tail: String(sig).slice(-16)
+		                            }));
+		                        } catch { /* ignore */ }
+		                    }
+		                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, sig);
+		                    newState.pendingToolUseIds = [];
+		                }
+		            }
                 if (newState.thinkingStopped) {
                     if (process.env.DEBUG_THINKING_FLOW && thinkingParts.length > 0) {
                         console.warn(JSON.stringify({
@@ -1003,11 +1073,25 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                         cacheClaudeLastThinkingSignature(newState.userKey, sig);
                         newState.lastUserThinkingSignature = sig;
                     }
-	                if (newState.pendingToolUseIds.length > 0) {
-	                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, sig);
-	                    newState.pendingToolUseIds = [];
-	                }
-	            }
+		                if (newState.pendingToolUseIds.length > 0) {
+		                    if (DEBUG_CLAUDE_THINKING_SIGNATURE) {
+		                        try {
+		                            console.warn(JSON.stringify({
+		                                kind: 'claude_thinking_signature_flush',
+		                                phase: 'sse_non_thinking_part',
+		                                requestId,
+		                                userKey: newState.userKey || null,
+		                                tool_use_ids: newState.pendingToolUseIds.slice(0, 20),
+		                                tool_use_count: newState.pendingToolUseIds.length,
+		                                sig_prefix: String(sig).slice(0, 24),
+		                                sig_tail: String(sig).slice(-16)
+		                            }));
+		                        } catch { /* ignore */ }
+		                    }
+		                    for (const id of newState.pendingToolUseIds) cacheClaudeThinkingSignature(id, sig);
+		                    newState.pendingToolUseIds = [];
+		                }
+		            }
 
             // thinking 启用时，确保响应的第一个块是 thinking/redacted_thinking（Claude Code/上游校验需要）
             // 注意：上游可能会先发一个"空 text"占位 chunk（text: ""），随后才开始下发 thought parts。
@@ -1049,17 +1133,50 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
             }
 
 	            // 处理工具调用
-	            if (part.functionCall) {
-	                newState.hasToolUse = true;
-	                const toolIndex = newState.nextIndex || (newState.hasThinking ? 1 : 0);
-	                newState.nextIndex = toolIndex + 1;
-	                const toolUseId = part.functionCall.id || `toolu_${uuidv4().slice(0, 8)}`;
-                    newState.pendingToolUseIds.push(toolUseId);
+		            if (part.functionCall) {
+		                newState.hasToolUse = true;
+		                const toolIndex = newState.nextIndex || (newState.hasThinking ? 1 : 0);
+		                newState.nextIndex = toolIndex + 1;
+		                const toolUseId = part.functionCall.id || `toolu_${uuidv4().slice(0, 8)}`;
+	                    // IMPORTANT: Upstream can send thoughtSignature BEFORE functionCall.
+	                    // If we only rely on pendingToolUseIds (signature after tool_use), we will miss caching and later
+	                    // fall back to lastSig, causing signature replay pollution and UI "old thinking" repeats.
+	                    if (newState.lastThinkingSignature) {
+	                        cacheClaudeThinkingSignature(toolUseId, newState.lastThinkingSignature);
+	                        if (DEBUG_CLAUDE_THINKING_SIGNATURE) {
+	                            try {
+	                                console.warn(JSON.stringify({
+	                                    kind: 'claude_thinking_signature_bind',
+	                                    phase: 'sse_function_call',
+	                                    requestId,
+	                                    userKey: newState.userKey || null,
+	                                    tool_use_id: toolUseId,
+	                                    sig_prefix: String(newState.lastThinkingSignature).slice(0, 24),
+	                                    sig_tail: String(newState.lastThinkingSignature).slice(-16),
+	                                    source: 'stream_lastThinkingSignature'
+	                                }));
+	                            } catch { /* ignore */ }
+	                        }
+	                    } else {
+	                        newState.pendingToolUseIds.push(toolUseId);
+	                        if (DEBUG_CLAUDE_THINKING_SIGNATURE) {
+	                            try {
+	                                console.warn(JSON.stringify({
+	                                    kind: 'claude_thinking_signature_pending',
+	                                    phase: 'sse_function_call',
+	                                    requestId,
+	                                    userKey: newState.userKey || null,
+	                                    tool_use_id: toolUseId,
+	                                    reason: 'no_lastThinkingSignature_yet'
+	                                }));
+	                            } catch { /* ignore */ }
+	                        }
+	                    }
 
-	                events.push({
-	                    type: 'content_block_start',
-	                    index: toolIndex,
-	                    content_block: {
+		                events.push({
+		                    type: 'content_block_start',
+		                    index: toolIndex,
+		                    content_block: {
 	                        type: 'tool_use',
 	                        id: toolUseId,
 	                        name: part.functionCall.name,
@@ -1388,16 +1505,33 @@ export function preprocessAnthropicRequest(request) {
                 const recovered = getCachedClaudeThinkingSignature(id);
                 if (recovered) return recovered;
             }
-            // 某些回合上游不会再次下发 thoughtSignature：用 last-signature 兜底
-            if (userKey) {
-                const lastSig = getCachedClaudeLastThinkingSignature(userKey);
-                if (lastSig) {
-                    for (const id of toolUseIds) cacheClaudeThinkingSignature(id, lastSig);
-                    return lastSig;
-                }
-            }
-            return null;
-        };
+	            // 某些回合上游不会再次下发 thoughtSignature：用 last-signature 兜底
+	            if (userKey) {
+	                const lastSig = getCachedClaudeLastThinkingSignature(userKey);
+	                if (lastSig) {
+	                    const willWriteback = shouldWritebackClaudeLastSig(userKey);
+	                    if (DEBUG_CLAUDE_THINKING_SIGNATURE) {
+	                        try {
+	                            console.warn(JSON.stringify({
+	                                kind: 'claude_thinking_signature_fallback',
+	                                phase: 'preprocess_tool_use_history',
+	                                userKey,
+	                                tool_use_ids: toolUseIds.slice(0, 20),
+	                                tool_use_count: toolUseIds.length,
+	                                sig_prefix: String(lastSig).slice(0, 24),
+	                                sig_tail: String(lastSig).slice(-16),
+	                                writeback: willWriteback
+	                            }));
+	                        } catch { /* ignore */ }
+	                    }
+	                    if (willWriteback) {
+	                        for (const id of toolUseIds) cacheClaudeThinkingSignature(id, lastSig);
+	                    }
+	                    return lastSig;
+	                }
+	            }
+	            return null;
+	        };
 
         // 1) 含 tool_use：必须有“开头 thinking + signature”
         if (hasToolUse) {
