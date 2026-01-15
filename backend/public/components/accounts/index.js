@@ -10,7 +10,7 @@ import { toast } from '../../ui/toast.js';
 
 export class AccountsPage extends Component {
   render() {
-    const { list, loading } = store.get('accounts') || {};
+    const { list, loading, refreshingAll } = store.get('accounts') || {};
     const accounts = list || [];
 
     return `
@@ -22,27 +22,17 @@ export class AccountsPage extends Component {
               <button class="btn btn-primary btn-sm" data-cmd="oauth:open">
                 + OAuth 添加
               </button>
-              <button class="btn btn-sm" data-cmd="accounts:refresh-all" ${loading ? 'disabled' : ''}>
-                ${loading ? '<span class="spinner"></span>' : ''} 刷新全部
+              <button class="btn btn-sm" data-cmd="import:open">
+                📥 导入
+              </button>
+              <button class="btn btn-sm" data-cmd="accounts:export">
+                📦 导出全部
+              </button>
+              <button class="btn btn-sm" data-cmd="accounts:refresh-all" ${refreshingAll ? 'disabled' : ''}>
+                ${refreshingAll ? '<span class="spinner"></span>' : ''} 刷新全部
               </button>
             </div>
           </div>
-
-          <!-- 快速添加表单 -->
-          <form id="addAccountForm" class="form-row mb-4"
-                style="padding-bottom:20px; border-bottom:1px solid var(--color-border)">
-            <div class="form-group">
-              <label class="form-label">Email</label>
-              <input id="addEmail" class="form-input" placeholder="user@gmail.com" required />
-            </div>
-            <div class="form-group" style="flex:2">
-              <label class="form-label">Refresh Token</label>
-              <input id="addRefresh" class="form-input font-mono" placeholder="1//..." required />
-            </div>
-            <button class="btn btn-primary" type="submit" style="align-self:flex-end">
-              快速添加
-            </button>
-          </form>
 
           <!-- 账号列表 -->
           <div class="table-wrapper">
@@ -69,6 +59,7 @@ export class AccountsPage extends Component {
         <!-- Dialogs 必须在同一个顶级容器内，否则 _patchDOM 无法更新它们 -->
         ${this._renderOAuthDialog()}
         ${this._renderQuotaDialog()}
+        ${this._renderImportDialog()}
       </div>
     `;
   }
@@ -124,29 +115,33 @@ export class AccountsPage extends Component {
         <td class="mono" data-label="配额">${quota}</td>
         <td class="mono ${a.error_count > 0 ? 'text-danger' : ''}" data-label="错误">${a.error_count || 0}</td>
         <td class="mono" data-label="最后使用" style="font-size:11px">${formatTime(a.last_used_at)}</td>
-        <td data-label="操作">
-          <div class="actions">
-            <button class="btn btn-sm btn-icon" 
-                    data-cmd="accounts:refresh" 
-                    data-id="${a.id}" 
-                    title="刷新 Token">↻</button>
-            <button class="btn btn-sm btn-icon" 
-                    data-cmd="accounts:view-quota" 
-                    data-id="${a.id}" 
-                    title="查看配额">📊</button>
-            <button class="btn btn-sm ${status === 'active' ? 'btn-danger' : ''}" 
-                    data-cmd="accounts:toggle-status" 
-                    data-id="${a.id}" 
-                    data-status="${status}">
-              ${status === 'active' ? '禁用' : '启用'}
-            </button>
-            <button class="btn btn-sm btn-danger btn-icon" 
-                    data-cmd="accounts:delete" 
-                    data-id="${a.id}"
-                    data-email="${this._escape(a.email)}"
-                    title="删除">✕</button>
-          </div>
-        </td>
+<td data-label="操作">
+            <div class="actions">
+              <button class="btn btn-sm btn-icon" 
+                      data-cmd="accounts:refresh" 
+                      data-id="${a.id}" 
+                      title="刷新 Token">↻</button>
+              <button class="btn btn-sm btn-icon" 
+                      data-cmd="accounts:view-quota" 
+                      data-id="${a.id}" 
+                      title="查看配额">📊</button>
+              <button class="btn btn-sm btn-icon" 
+                      data-cmd="accounts:export-single" 
+                      data-id="${a.id}" 
+                      title="导出 Token">📤</button>
+              <button class="btn btn-sm ${status === 'active' ? 'btn-danger' : ''}" 
+                      data-cmd="accounts:toggle-status" 
+                      data-id="${a.id}" 
+                      data-status="${status}">
+                ${status === 'active' ? '禁用' : '启用'}
+              </button>
+              <button class="btn btn-sm btn-danger btn-icon" 
+                      data-cmd="accounts:delete" 
+                      data-id="${a.id}"
+                      data-email="${this._escape(a.email)}"
+                      title="删除">✕</button>
+            </div>
+          </td>
       </tr>
     `;
   }
@@ -188,7 +183,7 @@ export class AccountsPage extends Component {
     `;
   }
 
-  _renderQuotaDialog() {
+_renderQuotaDialog() {
     const quota = store.get('dialogs.quota') || {};
     const { open, account, data, loading } = quota;
 
@@ -298,14 +293,80 @@ export class AccountsPage extends Component {
     `;
   }
 
-  onMount() {
-    this.watch(['accounts', 'dialogs.oauth', 'dialogs.quota']);
+  _renderImportDialog() {
+    const importDialog = store.get('dialogs.import') || {};
+    const { tab = 'manual' } = importDialog;
+
+    return `
+      <dialog id="importDialog" class="import-dialog">
+        <div class="dialog-header">
+          <div class="dialog-title">导入账号</div>
+          <div class="dialog-subtitle">手动输入或从文件导入</div>
+        </div>
+        <div class="dialog-body">
+          <div class="import-tabs">
+            <button class="import-tab ${tab === 'manual' ? 'active' : ''}" data-action="import-tab" data-tab="manual">
+              手动输入
+            </button>
+            <button class="import-tab ${tab === 'file' ? 'active' : ''}" data-action="import-tab" data-tab="file">
+              文件导入
+            </button>
+          </div>
+          
+          <div class="import-content">
+            ${tab === 'manual' ? this._renderManualImportForm() : this._renderFileImportForm()}
+          </div>
+        </div>
+        <div class="dialog-footer">
+          <button class="btn" data-cmd="import:close">取消</button>
+          ${tab === 'manual' ? '<button class="btn btn-primary" data-action="import-manual-submit">添加账号</button>' : ''}
+        </div>
+      </dialog>
+    `;
+  }
+
+  _renderManualImportForm() {
+    return `
+      <form id="manualImportForm" class="import-form">
+        <div class="form-group">
+          <label class="form-label">Email <span class="text-danger">*</span></label>
+          <input id="importEmail" class="form-input" placeholder="user@gmail.com" required />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Refresh Token <span class="text-danger">*</span></label>
+          <input id="importRefreshToken" class="form-input font-mono" placeholder="1//..." required />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Project ID <span class="text-secondary">(可选)</span></label>
+          <input id="importProjectId" class="form-input font-mono" placeholder="可选，留空会自动获取" />
+        </div>
+      </form>
+    `;
+  }
+
+  _renderFileImportForm() {
+    return `
+      <div class="file-import-zone" id="fileDropZone">
+        <div class="file-import-icon">📁</div>
+        <div class="file-import-text">拖拽 JSON 文件到此处</div>
+        <div class="file-import-or">或</div>
+        <button class="btn btn-primary" data-action="import-file-select">选择文件</button>
+        <input type="file" id="importFileInput" accept=".json" style="display:none" />
+        <div class="file-import-hint">
+          支持格式：[{"email":"...","refresh_token":"...","project_id":"..."}]
+        </div>
+      </div>
+    `;
+  }
+
+onMount() {
+    this.watch(['accounts', 'dialogs.oauth', 'dialogs.quota', 'dialogs.import']);
   }
 
   onUpdate() {
-    // 同步 dialog 的 open 状态
     this._syncDialogState('oauthDialog', store.get('dialogs.oauth.open'));
     this._syncDialogState('quotaDialog', store.get('dialogs.quota.open'));
+    this._syncDialogState('importDialog', store.get('dialogs.import.open'));
   }
 
   _syncDialogState(dialogId, shouldBeOpen) {
@@ -319,8 +380,7 @@ export class AccountsPage extends Component {
     }
   }
 
-  _bindEvents() {
-    // 命令按钮点击
+_bindEvents() {
     this.delegate('click', '[data-cmd]', (e, target) => {
       const cmd = target.dataset.cmd;
       const id = target.dataset.id;
@@ -330,30 +390,6 @@ export class AccountsPage extends Component {
       commands.dispatch(cmd, { id, currentStatus: status, email });
     });
 
-    // 添加账号表单提交
-    this.on('#addAccountForm', 'submit', async (e) => {
-      e.preventDefault();
-      
-      const email = this.container.querySelector('#addEmail')?.value?.trim();
-      const refreshToken = this.container.querySelector('#addRefresh')?.value?.trim();
-
-      if (!email || !refreshToken) {
-        toast.error('请填写完整信息');
-        return;
-      }
-
-      try {
-        await commands.dispatch('accounts:create', { email, refreshToken });
-        
-        // 清空表单
-        const form = this.container.querySelector('#addAccountForm');
-        if (form) form.reset();
-      } catch (error) {
-        // 错误已在 command 中处理
-      }
-    });
-
-    // OAuth 交换按钮
     this.on('[data-action="oauth-exchange"]', 'click', async () => {
       const callbackUrl = this.container.querySelector('#oauthCallback')?.value || '';
       
@@ -369,7 +405,60 @@ export class AccountsPage extends Component {
       }
     });
 
-    // Dialog 背景点击关闭
+    this.delegate('click', '[data-action="import-tab"]', (e, target) => {
+      const tab = target.dataset.tab;
+      store.set('dialogs.import.tab', tab);
+    });
+
+    this.on('[data-action="import-manual-submit"]', 'click', async () => {
+      const email = this.container.querySelector('#importEmail')?.value?.trim();
+      const refreshToken = this.container.querySelector('#importRefreshToken')?.value?.trim();
+      const projectId = this.container.querySelector('#importProjectId')?.value?.trim() || null;
+
+      if (!email || !refreshToken) {
+        toast.error('请填写 Email 和 Refresh Token');
+        return;
+      }
+
+      try {
+        await commands.dispatch('accounts:create', { email, refreshToken, projectId });
+        store.set('dialogs.import.open', false);
+      } catch (error) {
+        toast.error(error.message);
+      }
+    });
+
+    this.on('[data-action="import-file-select"]', 'click', () => {
+      this.container.querySelector('#importFileInput')?.click();
+    });
+
+    this.on('#importFileInput', 'change', async (e) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        await this._handleFileImport(file);
+      }
+    });
+
+    this.on('#fileDropZone', 'dragover', (e) => {
+      e.preventDefault();
+      e.currentTarget.classList.add('drag-over');
+    });
+
+    this.on('#fileDropZone', 'dragleave', (e) => {
+      e.currentTarget.classList.remove('drag-over');
+    });
+
+    this.on('#fileDropZone', 'drop', async (e) => {
+      e.preventDefault();
+      e.currentTarget.classList.remove('drag-over');
+      const file = e.dataTransfer?.files?.[0];
+      if (file && file.name.endsWith('.json')) {
+        await this._handleFileImport(file);
+      } else {
+        toast.error('请选择 JSON 文件');
+      }
+    });
+
     this.on('dialog', 'click', (e) => {
       if (e.target.tagName === 'DIALOG') {
         const dialogId = e.target.id;
@@ -377,11 +466,12 @@ export class AccountsPage extends Component {
           commands.dispatch('oauth:close');
         } else if (dialogId === 'quotaDialog') {
           commands.dispatch('accounts:close-quota');
+        } else if (dialogId === 'importDialog') {
+          commands.dispatch('import:close');
         }
       }
     });
 
-    // ESC 关闭 dialog
     this.on('dialog', 'cancel', (e) => {
       e.preventDefault();
       const dialogId = e.target.id;
@@ -389,8 +479,79 @@ export class AccountsPage extends Component {
         commands.dispatch('oauth:close');
       } else if (dialogId === 'quotaDialog') {
         commands.dispatch('accounts:close-quota');
+      } else if (dialogId === 'importDialog') {
+        commands.dispatch('import:close');
       }
     });
+  }
+
+  async _handleFileImport(file) {
+    const loading = toast.loading('正在导入...');
+    
+    try {
+      const text = await file.text();
+      let data;
+      
+      try {
+        data = JSON.parse(text);
+      } catch {
+        loading.update('JSON 格式错误', 'error');
+        setTimeout(() => loading.close(), 2000);
+        return;
+      }
+      
+      let accounts;
+      if (Array.isArray(data)) {
+        accounts = data;
+      } else if (data.accounts && Array.isArray(data.accounts)) {
+        accounts = data.accounts;
+      } else if (data.email && data.refresh_token) {
+        accounts = [data];
+      } else {
+        accounts = [];
+      }
+      
+      if (accounts.length === 0) {
+        loading.update('未找到有效账号数据', 'warning');
+        setTimeout(() => loading.close(), 2000);
+        return;
+      }
+      
+      const validAccounts = accounts.filter(a => a.email && a.refresh_token).map(a => ({
+        email: a.email,
+        refresh_token: a.refresh_token,
+        project_id: a.project_id || null
+      }));
+      
+      if (validAccounts.length === 0) {
+        loading.update('未找到包含 email 和 refresh_token 的账号', 'warning');
+        setTimeout(() => loading.close(), 2000);
+        return;
+      }
+      
+      const result = await commands.dispatch('accounts:import-batch', { accounts: validAccounts });
+      const results = result?.results || [];
+      const successCount = results.filter(r => r.success).length;
+      const failCount = results.length - successCount;
+      const withProjectId = results.filter(r => r.success && r.project_id).length;
+      const withoutProjectId = successCount - withProjectId;
+      
+      loading.close();
+      
+      if (failCount > 0) {
+        toast.warning(`导入完成：${successCount} 成功，${failCount} 失败`);
+      } else if (withoutProjectId > 0) {
+        toast.warning(`已导入 ${successCount} 个账号，但 ${withoutProjectId} 个未获取 project id（可能无法使用）`);
+      } else {
+        toast.success(`已导入 ${successCount} 个账号，全部成功获取 project id`);
+      }
+      
+      store.set('dialogs.import.open', false);
+      await commands.dispatch('accounts:load', { silent: true });
+    } catch (error) {
+      loading.close();
+      toast.error(error.message || '导入失败');
+    }
   }
 }
 

@@ -1328,6 +1328,10 @@ dialog[open] {
 /* === Toast 容器 === */
 .toast-container {
   position: fixed;
+  /* Keep the container pinned to the bottom-right consistently across browsers. */
+  inset: auto;
+  top: auto;
+  left: auto;
   bottom: 28px;
   right: 28px;
   display: flex;
@@ -1335,6 +1339,15 @@ dialog[open] {
   gap: 8px;
   z-index: 9999;
   pointer-events: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.toast-container--in-dialog {
+  position: absolute;
+  bottom: 18px;
+  right: 18px;
 }
 
 .toast-container .toast {
@@ -1901,4 +1914,95 @@ dialog[open] {
   .dialog-body {
     max-height: calc(100vh - 160px);
   }
+}
+
+/* === Import Dialog === */
+.import-dialog {
+  width: 480px;
+  max-width: 90vw;
+}
+
+.import-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 20px;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  padding: 4px;
+}
+
+.import-tab {
+  flex: 1;
+  padding: 10px 16px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: var(--transition-fast);
+}
+
+.import-tab:hover {
+  color: var(--color-text);
+}
+
+.import-tab.active {
+  background: var(--color-primary);
+  color: white;
+}
+
+.import-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.import-form .form-group {
+  margin: 0;
+}
+
+.file-import-zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  border: 2px dashed var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  transition: var(--transition-fast);
+  cursor: pointer;
+}
+
+.file-import-zone:hover,
+.file-import-zone.drag-over {
+  border-color: var(--color-primary);
+  background: rgba(99, 102, 241, 0.05);
+}
+
+.file-import-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  opacity: 0.6;
+}
+
+.file-import-text {
+  font-size: 14px;
+  color: var(--color-text);
+  margin-bottom: 8px;
+}
+
+.file-import-or {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  margin: 8px 0;
+}
+
+.file-import-hint {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-top: 16px;
+  font-family: var(--font-mono);
 }

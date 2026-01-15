@@ -1,5 +1,5 @@
 import { OAUTH_CONFIG } from '../config.js';
-import { createAccount, getAccountByEmail, updateAccountToken } from '../db/index.js';
+import { createAccount, getAccountByEmail, getAccountById, updateAccountToken } from '../db/index.js';
 import { initializeAccount } from '../services/tokenManager.js';
 import { verifyAdmin } from '../middleware/auth.js';
 
@@ -86,13 +86,20 @@ export default async function oauthRoutes(fastify) {
                 // ignore
             }
 
+            // Read back the latest account data (project_id might have been updated during initialization).
+            const latestAccount = getAccountById(account.id);
+            const project_id = latestAccount?.project_id || account.project_id || null;
+            const tier = latestAccount?.tier || account.tier || null;
+
             return {
                 success: true,
                 data: {
                     email,
                     access_token,
                     refresh_token,
-                    expires_in
+                    expires_in,
+                    project_id,
+                    tier
                 }
             };
         } catch (error) {

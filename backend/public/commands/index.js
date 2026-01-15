@@ -89,8 +89,10 @@ commands.register('dashboard:load', async () => {
 
 // ============ 账号命令 ============
 
-commands.register('accounts:load', async () => {
-  store.set('accounts.loading', true);
+commands.register('accounts:load', async ({ silent = false } = {}) => {
+  if (!silent) {
+    store.set('accounts.loading', true);
+  }
   store.set('accounts.error', null);
   
   try {
@@ -100,19 +102,29 @@ commands.register('accounts:load', async () => {
     store.set('accounts.error', error.message);
     throw error;
   } finally {
-    store.set('accounts.loading', false);
+    if (!silent) {
+      store.set('accounts.loading', false);
+    }
   }
 });
 
-commands.register('accounts:create', async ({ email, refreshToken }) => {
+commands.register('accounts:create', async ({ email, refreshToken, projectId }) => {
   const loading = toast.loading('正在添加账号...');
   
   try {
-    await api.createAccount(email, refreshToken);
-    loading.update('账号添加成功', 'success');
-    setTimeout(() => loading.close(), 2000);
+    const result = await api.createAccount(email, refreshToken, projectId);
+    const data = result?.data || result;
+    const returnedProjectId = data?.project_id || projectId || null;
+
+    if (returnedProjectId) {
+      loading.update(`账号添加成功，project id：${returnedProjectId}`, 'success');
+    } else {
+      loading.update('账号添加成功，但未获取 project id（账号可能无法使用）', 'warning');
+    }
+
+setTimeout(() => loading.close(), 2500);
     
-    await commands.dispatch('accounts:load');
+    await commands.dispatch('accounts:load', { silent: true });
     return true;
   } catch (error) {
     loading.close();
@@ -124,11 +136,19 @@ commands.register('accounts:refresh', async ({ id }) => {
   const loading = toast.loading('正在刷新Token...');
   
   try {
-    await api.refreshAccount(id);
-    loading.update('Token已刷新', 'success');
-    setTimeout(() => loading.close(), 2000);
+    const result = await api.refreshAccount(id);
+    const data = result?.data || result;
+    const projectId = data?.project_id || null;
+
+    if (projectId) {
+      loading.update(`Token已刷新，成功获取 project id：${projectId}`, 'success');
+    } else {
+      loading.update('Token已刷新，但未获取 project id（账号可能无法使用）', 'warning');
+    }
+
+    setTimeout(() => loading.close(), 2500);
     
-    await commands.dispatch('accounts:load');
+    await commands.dispatch('accounts:load', { silent: true });
   } catch (error) {
     loading.close();
     throw error;
@@ -136,6 +156,7 @@ commands.register('accounts:refresh', async ({ id }) => {
 });
 
 commands.register('accounts:refresh-all', async () => {
+  store.set('accounts.refreshingAll', true);
   const loading = toast.loading('正在刷新全部账号...');
   
   try {
@@ -147,10 +168,12 @@ commands.register('accounts:refresh-all', async () => {
     loading.update(message, 'success');
     setTimeout(() => loading.close(), 2000);
     
-    await commands.dispatch('accounts:load');
+    await commands.dispatch('accounts:load', { silent: true });
   } catch (error) {
     loading.close();
     throw error;
+  } finally {
+    store.set('accounts.refreshingAll', false);
   }
 });
 
@@ -161,7 +184,7 @@ commands.register('accounts:toggle-status', async ({ id, currentStatus }) => {
   await api.updateAccountStatus(id, newStatus);
   toast.success(`账号已${actionText}`);
   
-  await commands.dispatch('accounts:load');
+  await commands.dispatch('accounts:load', { silent: true });
 });
 
 commands.register('accounts:delete', async ({ id, email }) => {
@@ -174,10 +197,10 @@ commands.register('accounts:delete', async ({ id, email }) => {
 
   if (!confirmed) return false;
 
-  await api.deleteAccount(id);
+await api.deleteAccount(id);
   toast.success('账号已删除');
   
-  await commands.dispatch('accounts:load');
+  await commands.dispatch('accounts:load', { silent: true });
   return true;
 });
 
@@ -214,6 +237,90 @@ commands.register('accounts:view-quota', async ({ id }) => {
 
 commands.register('accounts:close-quota', () => {
   store.set('dialogs.quota.open', false);
+});
+
+commands.register('import:open', () => {
+  store.batch(() => {
+    store.set('dialogs.import.open', true);
+    store.set('dialogs.import.tab', 'manual');
+  });
+});
+
+commands.register('import:close', () => {
+  store.set('dialogs.import.open', false);
+});
+
+commands.register('accounts:import-batch', async ({ accounts }) => {
+  const result = await api.importAccounts(accounts);
+  return result;
+});
+
+commands.register('accounts:export', async () => {
+  const loading = toast.loading('正在导出账号...');
+  
+  try {
+    const result = await api.exportAccounts();
+    const accounts = result?.accounts || [];
+    
+    if (accounts.length === 0) {
+      loading.update('没有可导出的账号', 'warning');
+      setTimeout(() => loading.close(), 2000);
+      return;
+    }
+    
+    const json = JSON.stringify(accounts, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `tokens-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    
+    loading.update(`已导出 ${accounts.length} 个账号`, 'success');
+    setTimeout(() => loading.close(), 2000);
+  } catch (error) {
+    loading.close();
+    throw error;
+  }
+});
+
+commands.register('accounts:export-single', async ({ id }) => {
+  const loading = toast.loading('正在导出...');
+  
+  try {
+    const result = await api.exportAccounts();
+    const accounts = result?.accounts || [];
+    const account = accounts.find(a => String(a.email) || String(a.project_id));
+    const target = accounts.find(a => {
+      const list = store.get('accounts.list') || [];
+      const match = list.find(acc => String(acc.id) === String(id));
+      return match && a.email === match.email;
+    });
+    
+    if (!target) {
+      loading.update('未找到该账号', 'error');
+      setTimeout(() => loading.close(), 2000);
+      return;
+    }
+    
+    const json = JSON.stringify(target, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `token-${target.email.split('@')[0]}-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    
+    loading.update('已导出', 'success');
+    setTimeout(() => loading.close(), 1500);
+  } catch (error) {
+    loading.close();
+    throw error;
+  }
 });
 
 // ============ 日志命令 ============
@@ -368,9 +475,17 @@ commands.register('oauth:exchange', async ({ callbackUrl }) => {
   const loading = toast.loading('正在交换Token...');
   
   try {
-    await api.exchangeOAuthCode(code, finalPort);
-    loading.update('账号添加成功', 'success');
-    setTimeout(() => loading.close(), 2000);
+    const result = await api.exchangeOAuthCode(code, finalPort);
+    const data = result?.data || result;
+    const projectId = data?.project_id || null;
+
+    if (projectId) {
+      loading.update(`账号添加成功，成功获取 project id：${projectId}`, 'success');
+    } else {
+      loading.update('账号添加成功，但未获取 project id（账号可能无法使用）', 'warning');
+    }
+
+    setTimeout(() => loading.close(), 2500);
     
     store.set('dialogs.oauth.open', false);
     await commands.dispatch('accounts:load');

@@ -248,10 +248,10 @@ class ApiService {
     });
   }
 
-  async createAccount(email, refreshToken) {
+async createAccount(email, refreshToken, projectId = null) {
     return this.request('/admin/accounts', {
       method: 'POST',
-      body: { email, refresh_token: refreshToken }
+      body: { email, refresh_token: refreshToken, project_id: projectId }
     });
   }
 
@@ -276,9 +276,20 @@ class ApiService {
     });
   }
 
-  async deleteAccount(id) {
+async deleteAccount(id) {
     return this.request(`/admin/accounts/${encodeURIComponent(id)}`, {
       method: 'DELETE'
+    });
+  }
+
+  async exportAccounts() {
+    return this.request('/admin/accounts/export');
+  }
+
+  async importAccounts(accounts) {
+    return this.request('/admin/accounts/batch', {
+      method: 'POST',
+      body: { accounts }
     });
   }
 

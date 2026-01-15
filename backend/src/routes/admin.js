@@ -64,6 +64,17 @@ export default async function adminRoutes(fastify) {
         return { accounts };
     });
 
+    // GET /admin/accounts/export - 导出所有账号（email + refresh_token + project_id）
+    fastify.get('/admin/accounts/export', async () => {
+        const accounts = getAllAccountsForRefresh();
+        const exportData = accounts.map(a => ({
+            email: a.email,
+            refresh_token: a.refresh_token,
+            project_id: a.project_id || null
+        }));
+        return { accounts: exportData };
+    });
+
     // GET /admin/accounts/:id
     fastify.get('/admin/accounts/:id', async (request) => {
         const { id } = request.params;
@@ -82,7 +93,7 @@ export default async function adminRoutes(fastify) {
 
     // POST /admin/accounts
     fastify.post('/admin/accounts', async (request, reply) => {
-        const { email, refresh_token } = request.body;
+        const { email, refresh_token, project_id } = request.body;
 
         if (!email || !refresh_token) {
             return reply.code(400).send({
@@ -91,7 +102,7 @@ export default async function adminRoutes(fastify) {
         }
 
         try {
-            const accountId = createAccount(email, refresh_token);
+            const accountId = createAccount(email, refresh_token, project_id || null);
             const account = getAccountById(accountId);
 
             // 初始化账号（刷新 token + 获取 projectId）
@@ -101,9 +112,12 @@ export default async function adminRoutes(fastify) {
                 // 不删除账号，只是标记为 error 状态
             }
 
+            const latest = getAccountById(accountId);
             return {
                 success: true,
                 accountId,
+                project_id: latest?.project_id || project_id || null,
+                tier: latest?.tier || null,
                 message: 'Account created successfully'
             };
         } catch (error) {
@@ -128,8 +142,22 @@ export default async function adminRoutes(fastify) {
 
         for (const acc of accounts) {
             try {
-                const accountId = createAccount(acc.email, acc.refresh_token);
-                results.push({ email: acc.email, success: true, accountId });
+                const accountId = createAccount(acc.email, acc.refresh_token, acc.project_id || null);
+                const account = getAccountById(accountId);
+                
+                try {
+                    await initializeAccount(account);
+                } catch (initError) {
+                }
+                
+                const latest = getAccountById(accountId);
+                results.push({ 
+                    email: acc.email, 
+                    success: true, 
+                    accountId,
+                    project_id: latest?.project_id || acc.project_id || null,
+                    tier: latest?.tier || null
+                });
             } catch (error) {
                 results.push({ email: acc.email, success: false, error: error.message });
             }
@@ -169,7 +197,13 @@ export default async function adminRoutes(fastify) {
                 await fetchProjectId(account);
             }
             await fetchQuotaInfo(account);
-            return { success: true, message: 'Token refreshed' };
+            const latest = getAccountById(id);
+            return {
+                success: true,
+                message: 'Token refreshed',
+                project_id: latest?.project_id || account.project_id || null,
+                tier: latest?.tier || account.tier || null
+            };
         } catch (error) {
             return { error: { message: error.message } };
         }

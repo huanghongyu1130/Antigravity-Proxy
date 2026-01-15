@@ -6,6 +6,7 @@
 class ToastManager {
   constructor() {
     this._container = null;
+    this._dialogContainer = null;
     this._toasts = new Set();
     this._maxVisible = 5;
     this._init();
@@ -39,6 +40,55 @@ class ToastManager {
   }
 
   /**
+   * Ensure an in-dialog container exists for mirroring toasts while a modal <dialog> is open.
+   * @private
+   */
+  _ensureDialogContainer(modalDialog) {
+    if (!modalDialog) return null;
+
+    if (!this._dialogContainer) {
+      this._dialogContainer = document.createElement('div');
+      this._dialogContainer.className = 'toast-container toast-container--in-dialog';
+      this._dialogContainer.setAttribute('aria-live', 'polite');
+      this._dialogContainer.setAttribute('aria-label', '通知');
+    }
+
+    if (this._dialogContainer.parentNode !== modalDialog) {
+      modalDialog.appendChild(this._dialogContainer);
+    }
+
+    return this._dialogContainer;
+  }
+
+  /**
+   * Ensure the toast container is visible and on top (especially when modal dialogs are open).
+   * @private
+   */
+  _ensurePresented() {
+    if (!this._container) return;
+    if (this._container.parentNode !== document.body) {
+      document.body.appendChild(this._container);
+    }
+  }
+
+  /**
+   * @private
+   */
+  _getActiveModalDialog() {
+    // Prefer :modal when supported.
+    try {
+      const modal = document.querySelector('dialog:modal');
+      if (modal) return modal;
+    } catch {
+      // ignore
+    }
+
+    // Fallback: find any open dialog and use the last one (closest to "top-most").
+    const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+    return dialogs.length ? dialogs[dialogs.length - 1] : null;
+  }
+
+  /**
    * 显示通知
    * @param {string} message - 消息内容
    * @param {string} type - 类型：info, success, error, warning, loading
@@ -47,6 +97,7 @@ class ToastManager {
    */
   show(message, type = 'info', options = {}) {
     this._createContainer();
+    this._ensurePresented();
 
     const {
       duration = 3000,
@@ -87,6 +138,18 @@ class ToastManager {
       ` : ''}
     `;
 
+    // If there's an active modal dialog, also render a mirrored toast inside it so it's visible immediately.
+    const modal = this._getActiveModalDialog();
+    const dialogContainer = modal ? this._ensureDialogContainer(modal) : null;
+
+    let toastMirror = null;
+    if (dialogContainer) {
+      toastMirror = toast.cloneNode(true);
+      // Keep a reference so we can remove it together.
+      toast._toastMirror = toastMirror;
+      dialogContainer.appendChild(toastMirror);
+    }
+
     // 绑定事件
     if (action) {
       const actionBtn = toast.querySelector('.toast-action');
@@ -101,7 +164,24 @@ class ToastManager {
       closeBtn.addEventListener('click', () => this._remove(toast));
     }
 
-    // 添加到容器
+    if (toastMirror) {
+      if (action) {
+        const mirrorActionBtn = toastMirror.querySelector('.toast-action');
+        if (mirrorActionBtn) {
+          mirrorActionBtn.addEventListener('click', () => {
+            action.onClick?.();
+            this._remove(toast);
+          });
+        }
+      }
+
+      const mirrorCloseBtn = toastMirror.querySelector('.toast-close');
+      if (mirrorCloseBtn) {
+        mirrorCloseBtn.addEventListener('click', () => this._remove(toast));
+      }
+    }
+
+    // 添加到全局容器（会在 dialog 关闭后可见）
     this._container.appendChild(toast);
     this._toasts.add(toast);
 
@@ -111,6 +191,7 @@ class ToastManager {
     // 触发动画
     requestAnimationFrame(() => {
       toast.classList.add('show');
+      if (toastMirror) toastMirror.classList.add('show');
     });
 
     // 自动关闭
@@ -131,33 +212,51 @@ class ToastManager {
           timeoutId = null;
         }
 
-        toast.className = `toast toast-${newType || type} show`;
+        const effectiveType = newType || type;
+        toast.className = `toast toast-${effectiveType} show`;
+        if (toastMirror) toastMirror.className = `toast toast-${effectiveType} show`;
         
         const messageEl = toast.querySelector('.toast-message');
         if (messageEl) {
           messageEl.textContent = newMessage;
         }
+        const mirrorMessageEl = toastMirror?.querySelector?.('.toast-message');
+        if (mirrorMessageEl) {
+          mirrorMessageEl.textContent = newMessage;
+        }
 
         // 更新图标
         const iconEl = toast.querySelector('.toast-icon');
         const spinner = toast.querySelector('.spinner');
+        const mirrorIconEl = toastMirror?.querySelector?.('.toast-icon');
+        const mirrorSpinner = toastMirror?.querySelector?.('.spinner');
         
-        if (newType && newType !== 'loading') {
+        if (effectiveType && effectiveType !== 'loading') {
           if (spinner) {
             spinner.remove();
+          }
+          if (mirrorSpinner) {
+            mirrorSpinner.remove();
           }
           if (!iconEl) {
             const newIcon = document.createElement('span');
             newIcon.className = 'toast-icon';
-            newIcon.textContent = icons[newType] || icons.info;
+            newIcon.textContent = icons[effectiveType] || icons.info;
             toast.insertBefore(newIcon, messageEl);
+            if (toastMirror && !mirrorIconEl) {
+              const newMirrorIcon = document.createElement('span');
+              newMirrorIcon.className = 'toast-icon';
+              newMirrorIcon.textContent = icons[effectiveType] || icons.info;
+              toastMirror.insertBefore(newMirrorIcon, mirrorMessageEl);
+            }
           } else {
-            iconEl.textContent = icons[newType] || icons.info;
+            iconEl.textContent = icons[effectiveType] || icons.info;
+            if (mirrorIconEl) mirrorIconEl.textContent = icons[effectiveType] || icons.info;
           }
         }
 
         // 如果更新为非loading类型，设置自动关闭
-        if (newType && newType !== 'loading' && !persistent) {
+        if (effectiveType && effectiveType !== 'loading' && !persistent) {
           timeoutId = setTimeout(() => this._remove(toast), duration);
         }
       },
@@ -180,6 +279,15 @@ class ToastManager {
    */
   _remove(toast) {
     if (!toast || !this._toasts.has(toast)) return;
+
+    const toastMirror = toast._toastMirror;
+    if (toastMirror) {
+      toastMirror.classList.remove('show');
+      setTimeout(() => {
+        toastMirror.remove();
+      }, 400);
+      toast._toastMirror = null;
+    }
 
     toast.classList.remove('show');
     this._toasts.delete(toast);
