@@ -160,17 +160,6 @@ antigravity-proxy/
 └── data/                # 数据持久化目录
 ```
 
-## 常见问题
-
-**Q: 出现 `Resource has been exhausted` 错误？**
-
-这是上游账号的速率限制，非配额问题。代理会自动等待冷却时间后重试。如果频繁出现，可以：
-- 增加账号：让账号池有更多选择
-- 调整重试次数：增大 `SAME_ACCOUNT_RETRIES`
-
-**Q: Claude Code 工具调用报错？**
-
-代理会自动处理 thinking signature 回放。如果仍有问题，检查账号配额是否充足。
 
 ## License
 
