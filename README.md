@@ -34,7 +34,7 @@
 # 1. 下载配置文件
 curl -O https://raw.githubusercontent.com/Kazuki-0147/Antigravity-Proxy/main/docker-compose.ghcr.yml
 
-# 2. 编辑配置文件，修改 API_KEY 和 ADMIN_PASSWORD
+# 2. 编辑docker-compose.ghcr.yml，修改 API_KEY 和 ADMIN_PASSWORD
 nano docker-compose.ghcr.yml  # 或使用其他编辑器
 
 # 3. 启动
