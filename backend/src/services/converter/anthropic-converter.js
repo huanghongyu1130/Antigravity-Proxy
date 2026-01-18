@@ -793,20 +793,12 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
             }
         }
 
-        // 若本回合没有下发 signature，但我们有“上一回合的 signature”，则复用它：
-        // - 让 tool_use 也能拥有 signature 以便下一轮回放
-        // - 让响应以 thinking/redacted_thinking 开头（Claude Code / 上游校验需要）
-        if (thinkingEnabled && !messageThinkingSignature && userKey) {
-            const recovered = getCachedClaudeLastThinkingSignature(userKey);
-            if (recovered) messageThinkingSignature = recovered;
-        }
-
-        if (thinkingEnabled && (thinkingText || messageThinkingSignature)) {
-            // 兼容：部分客户端还不支持 redacted_thinking（会直接报错/中断工具链路）。
-            // 这里始终输出 thinking 块；当 thinking 为空且存在 signature 时，后续请求回放阶段会在 preprocess 中转换为 redacted_thinking 再发往上游。
+        // 修复：只有当上游真的下发了 thinking 内容时，才输出 thinking 块
+        // 不再用 lastSig 兜底来创建空的 thinking 块，避免签名污染
+        if (thinkingEnabled && thinkingText) {
             content.unshift({
                 type: 'thinking',
-                thinking: thinkingText || '',
+                thinking: thinkingText,
                 ...(messageThinkingSignature ? { signature: messageThinkingSignature } : {})
             });
         }
@@ -905,12 +897,15 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                     ? isThinkingModel(model)
                     : !!newState.thinkingEnabled;
 
-            const emptyThinkingModeRaw = String(process.env.ANTHROPIC_SSE_EMPTY_THINKING_MODE || 'emit')
+            // 修复：默认不补空 thinking 块（suppress）
+            // 如果上游没下发 thinking，代理不应该伪造一个空的 thinking 块
+            // 这样可以避免使用旧签名兜底导致的签名污染问题
+            const emptyThinkingModeRaw = String(process.env.ANTHROPIC_SSE_EMPTY_THINKING_MODE || 'suppress')
                 .trim()
                 .toLowerCase();
             const emptyThinkingMode = ['emit', 'suppress', 'redacted'].includes(emptyThinkingModeRaw)
                 ? emptyThinkingModeRaw
-                : 'emit';
+                : 'suppress';
 
             // Track latest usage so we can emit stable token counts even if usageMetadata appears late in the stream.
             if (usage && typeof usage === 'object') {
@@ -1640,17 +1635,17 @@ export function preprocessAnthropicRequest(request) {
 	            return null;
 	        };
 
-        // 1) 含 tool_use：必须有“开头 thinking + signature”
-        if (hasToolUse) {
+        // 1) 含 tool_use 且有 thinking 块：需要确保 signature 完整
+        // 关键修复：如果历史消息没有 thinking 块，说明上游当时没下发 thinking，
+        // 不应该注入旧签名，因为上游不会校验一个它从未下发过的 thinking 块。
+        if (hasToolUse && firstThinkingIndex >= 0) {
             let signature = null;
 
             // 1.1) 优先使用消息内已有 signature（thinking/redacted_thinking 任意位置）
-            if (firstThinkingIndex >= 0) {
-                const sig = blocks[firstThinkingIndex]?.signature;
-                if (sig) signature = sig;
-            }
+            const sig = blocks[firstThinkingIndex]?.signature;
+            if (sig) signature = sig;
 
-            // 1.2) 其次从缓存恢复
+            // 1.2) 其次从缓存恢复（仅当历史本身有 thinking 块时才兜底）
             if (!signature) {
                 signature = recoverSignature();
             }
@@ -1674,7 +1669,7 @@ export function preprocessAnthropicRequest(request) {
                     blocks[0] = { type: 'redacted_thinking', signature };
                     localMutate = true;
                 }
-            } else if (firstThinkingIndex >= 0) {
+            } else {
                 // 有 thinking 但不在开头：移动到开头
                 const [thinkingBlock] = blocks.splice(firstThinkingIndex, 1);
                 const patchedThinkingBlock = thinkingBlock?.signature ? thinkingBlock : { ...thinkingBlock, signature };
@@ -1685,14 +1680,17 @@ export function preprocessAnthropicRequest(request) {
                         : patchedThinkingBlock;
                 blocks.unshift(ensuredThinkingBlock);
                 localMutate = true;
-            } else {
-                // 没有 thinking：插入一个 redacted_thinking 块（不伪造 thinking 文本）
-                blocks.unshift({ type: 'redacted_thinking', signature });
-                localMutate = true;
             }
 
             if (localMutate) didMutate = true;
             return localMutate ? { ...msg, content: blocks } : msg;
+        }
+
+        // 1b) 含 tool_use 但没有 thinking 块：不注入签名
+        // 上游当时没下发 thinking，回放时也不需要 thinking 块
+        if (hasToolUse && firstThinkingIndex < 0) {
+            // 直接返回，不做任何修改
+            return msg;
         }
 
         // Claude Code 兼容：如果客户端没回放 thinking 块，但我们曾经对“同内容的 assistant 消息”缓存过 signature，

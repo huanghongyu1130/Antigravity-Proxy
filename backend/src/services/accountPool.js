@@ -90,7 +90,8 @@ class AccountPool {
                 updateAccountLastUsed(account.id);
 
                 return validAccount;
-            } catch (error) {
+            } catch (err) {
+                console.error(`[ACCOUNT_POOL] getBestAccount ensureValidToken failed for account ${account.id} (${account.email}):`, err.message);
                 // 继续尝试下一个账号
             }
         }
@@ -204,7 +205,8 @@ class AccountPool {
                 updateAccountLastUsed(account.id);
 
                 return validAccount;
-            } catch {
+            } catch (err) {
+                console.error(`[ACCOUNT_POOL] ensureValidToken failed for account ${account.id} (${account.email}):`, err.message);
                 // 继续尝试下一个账号
             }
         }
