@@ -16,6 +16,7 @@ import { LogsPage } from './components/logs/index.js';
 
 // UI
 import { toast } from './ui/toast.js';
+import { InteractiveBackground } from './ui/interactive-bg.js';
 
 class App {
   constructor() {
@@ -29,6 +30,9 @@ class App {
    * 启动应用
    */
   async init() {
+    // 初始化背景特效
+    new InteractiveBackground();
+
     // 初始化主题
     await commands.dispatch('theme:init');
 
@@ -182,13 +186,13 @@ if (document.readyState === 'loading') {
 // 全局错误处理
 window.addEventListener('unhandledrejection', (event) => {
   console.error('Unhandled promise rejection:', event.reason);
-  
+
   // 不显示取消请求的错误
   if (event.reason?.message?.includes('请求已取消')) {
     event.preventDefault();
     return;
   }
-  
+
   toast.error(event.reason?.message || '发生错误');
 });
 

@@ -35,7 +35,7 @@ class AccountPool {
      * 获取最优账号
      * 策略：
      * 1. 筛选状态为 active 且配额 > 0 的账号
-     * 2. 优先选择配额剩余最多的账号
+     * 2. 优先选择配额剩余最少的账号（先用完一个再换下一个）
      * 3. 如果配额相同，选择最近最少使用的账号
      */
     async getBestAccount(model = null) {
@@ -49,11 +49,11 @@ class AccountPool {
         let earliestCooldownUntil = null;
         let cooldownCount = 0;
 
-        // 按配额降序、最后使用时间升序排序
+        // 按配额升序、最后使用时间升序排序（优先用完配额少的账号）
         accounts.sort((a, b) => {
-            // 首先按配额排序
-            if (b.quota_remaining !== a.quota_remaining) {
-                return b.quota_remaining - a.quota_remaining;
+            // 首先按配额排序（配额少的优先，先用完一个再换）
+            if (a.quota_remaining !== b.quota_remaining) {
+                return a.quota_remaining - b.quota_remaining;
             }
             // 配额相同时，优先使用最久未使用的账号
             return (a.last_used_at || 0) - (b.last_used_at || 0);
